@@ -15,24 +15,16 @@
     that:
       - apps_dirs | length > 0
     fail_msg: >-
-      No app directories discovered under {{ apps_root_candidates }}/apps.
-      Ensure you are running Ansible from the repo root and that
-      `apps/<app>/app.yml` exists on the controller.
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Set app sources root for this run
-  ansible.builtin.set_fact:
-    app_sources_root: "{{ (apps_dirs | first | dirname | dirname) }}"
-  when: (apps_dirs | length) > 0
+      No app directories discovered under apps_root={{ app_sources_root }}.
+      Ensure apps_root points to your control repo apps directory and that
+      `<app>/app.yml` exists for each app.
   delegate_to: localhost
   become: false
   run_once: true
 
 - name: Assert app sources root exists
   ansible.builtin.stat:
-    path: "{{ app_sources_root }}/apps"
+    path: "{{ app_sources_root }}"
   register: app_sources_root_stat
   delegate_to: localhost
   become: false
@@ -45,8 +37,8 @@
       - app_sources_root_stat.stat.exists
       - app_sources_root_stat.stat.isdir
     fail_msg: >-
-      Unable to resolve controller app sources root. Expected apps directory under
-      {{ app_sources_root | default('<unset>') }}.
+      Unable to resolve controller app sources root.
+      Expected apps_root directory at {{ app_sources_root | default('<unset>') }}.
   delegate_to: localhost
   become: false
   run_once: true

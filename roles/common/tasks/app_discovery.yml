@@ -1,31 +1,59 @@
 ---
-- name: Build app root candidates
-  ansible.builtin.set_fact:
-    apps_root_candidates:
-      - "{{ playbook_dir }}"
-      - "{{ inventory_dir | dirname | dirname }}"
-      - "{{ role_path | dirname | dirname }}"
+- name: Ensure apps_root is provided
+  ansible.builtin.assert:
+    that:
+      - apps_root is defined
+      - apps_root is string
+      - apps_root | trim | length > 0
+    fail_msg: >-
+      apps_root is required and must point to the apps directory on the controller
+      (for example: /path/to/control-repo/apps).
   delegate_to: localhost
   become: false
   run_once: true
 
-- name: Find app directories
+- name: Set canonical app sources root
+  ansible.builtin.set_fact:
+    app_sources_root: "{{ apps_root | trim }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Ensure apps_root exists and is a directory
+  ansible.builtin.stat:
+    path: "{{ app_sources_root }}"
+  register: apps_root_stat
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Validate apps_root directory
+  ansible.builtin.assert:
+    that:
+      - apps_root_stat.stat.exists
+      - apps_root_stat.stat.isdir
+    fail_msg: >-
+      apps_root '{{ app_sources_root }}' must exist and be a directory on the controller.
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Find app definition files
   ansible.builtin.find:
-    paths: "{{ item }}/apps"
-    file_type: directory
-    depth: 1
-  loop: "{{ apps_root_candidates }}"
+    paths: "{{ app_sources_root }}"
+    file_type: file
+    patterns:
+      - app.yml
+    recurse: true
+    depth: 2
   register: apps_find_results
   delegate_to: localhost
   become: false
   run_once: true
-  failed_when: false
 
 - name: Collect app directory paths
   ansible.builtin.set_fact:
-    apps_dirs: >-
-      {%- set match = (apps_find_results.results | selectattr('matched', '>', 0) | list | first) -%}
-      {{ match.files | map(attribute='path') | list if match is defined else [] }}
+    apps_dirs: "{{ apps_find_results.files | map(attribute='path') | map('dirname') | unique | sort | list }}"
   delegate_to: localhost
   become: false
   run_once: true

@@ -13,9 +13,10 @@ ansible-vault encrypt group_vars/all/vault.yml
 2. Map apps per host in `host_vars/<host>.yml` via `assigned_apps`.
 3. Adjust `group_vars/all/main.yml` for usernames, paths, and images.
 4. Define apps in `apps/<app>/app.yml`.
-5. Store secrets and overrides in `group_vars/all/vault.yml` and encrypt it.
-6. Bootstrap hosts and deploy: `ansible-playbook bootstrap.yml`.
-7. Deploy apps: `ansible-playbook deploy.yml`.
+5. Set `apps_root` to the controller path that contains app folders (for example `/path/to/control-repo/apps`). If omitted, it defaults to `apps` for backward compatibility.
+6. Store secrets and overrides in `group_vars/all/vault.yml` and encrypt it.
+7. Bootstrap hosts and deploy: `ansible-playbook bootstrap.yml -e "apps_root=/path/to/control-repo/apps"`.
+8. Deploy apps: `ansible-playbook deploy.yml -e "apps_root=/path/to/control-repo/apps"`.
 
 ## What gets installed
 
@@ -29,7 +30,7 @@ ansible-vault encrypt group_vars/all/vault.yml
 
 ## App model
 
-- App definitions live one per file under `apps/<app>/app.yml`; the folder name is the app name.
+- App definitions live one per file under `<apps_root>/<app>/app.yml`; the folder name is the app name.
 - Host assignment is controlled in `host_vars/<host>.yml` via `assigned_apps`.
 - Each app may have multiple containers; set `entrypoint: true` on the container Caddy should proxy by default (catch-all).
 - Volumes are defined by name plus `container_path`; the host path is derived automatically as `<app_data_base_path>/<app>/<volume name>` unless overridden.
@@ -38,7 +39,7 @@ ansible-vault encrypt group_vars/all/vault.yml
 - Mixed apps can define `static_paths` to serve filesystem paths from `/srv/data/static/<app>/public` alongside proxies.
 - Secret env overrides come from `vault_app_env_overrides` in the vaulted vars file.
 - Optional per-container `mounts` can stage files or directories under the app’s data path and mount them read-only into the container. Each mount needs `relative_path` (under the app base), `container_path`, and either `content` or `src`. Multiple mounts are supported.
-- Default mount sources resolve to `apps/<app>/<relative_path>`; set `src` to override (e.g., `src: "files/{{ app.name }}/{{ container.name }}/config.yaml"`).
+- Default mount sources resolve to `<apps_root>/<app>/files/<relative_path>`; set `src` to override.
 - Optional per-container `proxy_paths` can add path-based reverse proxy routes on the app's domains. This is useful when an app has multiple containers that should share the same domain (e.g., `/api/*` to an API container, and everything else to the web container).
   - `proxy_paths` is a list of objects with:
      - `path`: a Caddy path matcher like `/api/*`

@@ -27,7 +27,7 @@
 
 - name: Ensure app source path exists for this app
   ansible.builtin.stat:
-    path: "{{ app_sources_root }}/apps/{{ app.name }}"
+    path: "{{ app_sources_root }}/{{ app.name }}"
   register: app_source_path_stat
   delegate_to: localhost
   become: false
@@ -39,7 +39,7 @@
       - app_source_path_stat.stat.isdir
     fail_msg: >-
       Unable to locate app sources for {{ app.name }} under
-      {{ app_sources_root }}/apps.
+      {{ app_sources_root }}.
   delegate_to: localhost
   become: false
 

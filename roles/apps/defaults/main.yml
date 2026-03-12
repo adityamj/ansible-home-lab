@@ -10,6 +10,10 @@ data_mount: "/srv/data"
 # Base directory for app data
 app_data_base_path: "{{ data_mount }}/apps"
 
+# Controller path to app definitions directory.
+# Defaults to "apps" for backward compatibility; override with an absolute path in control repos.
+apps_root: "apps"
+
 # Static files base path (read-only mount in Caddy)
 static_base_path: "{{ data_mount }}/static"
 

@@ -56,7 +56,7 @@
       {%- for mnt in container.mounts | default([]) -%}
       {%-   set src_candidate = (
               mnt.src
-              | default('apps/' ~ app.name ~ '/files/' ~ mnt.relative_path)
+              | default(app.name ~ '/files/' ~ mnt.relative_path)
               | replace('{{ container.name }}', container.name)
             ) -%}
       {%-   set src_absolute = (src_candidate if src_candidate.startswith('/') else app_sources_root + '/' + src_candidate) -%}

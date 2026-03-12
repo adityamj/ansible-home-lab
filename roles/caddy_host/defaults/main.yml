@@ -26,6 +26,10 @@ caddy_admin_email: ""
 # Static files base path (read-only mount for serving static content)
 static_base_path: "{{ data_mount }}/static"
 
+# Controller path to app definitions directory.
+# Defaults to "apps" for backward compatibility; override with an absolute path in control repos.
+apps_root: "apps"
+
 # Resource limits for Caddy container
 caddy_memory_max: "512M"
 caddy_cpu_quota: "30%"
