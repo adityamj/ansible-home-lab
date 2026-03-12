@@ -1,0 +1,34 @@
+#!/usr/sbin/nft -f
+
+# Managed by Ansible.
+# Keep policy in filter chains only. Do not add NAT rules here;
+# netavark manages container NAT tables.
+
+{% set allowed_tcp_ports = ([22, 80, 443] + (nftables_extra_tcp_ports | default([]))) | map('int') | list | unique | sort %}
+{% set allowed_udp_ports = ([80, 443] + (nftables_extra_udp_ports | default([]))) | map('int') | list | unique | sort %}
+
+flush ruleset
+
+table inet host_firewall {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        tcp dport { {{ allowed_tcp_ports | join(', ') }} } ct state new accept
+        udp dport { {{ allowed_udp_ports | join(', ') }} } ct state new accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}

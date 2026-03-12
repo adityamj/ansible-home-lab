@@ -1,0 +1,85 @@
+# Caddy site config for {{ app.name }}
+{% set app_type = app.type | default('container') %}
+{% set domains = app.domains | default([]) %}
+{% if domains | length == 0 and app.ingress is defined and app.ingress.main_domain is defined %}
+{% set domains = [app.ingress.main_domain] %}
+{% endif %}
+{% set tls_mode = caddy_tls_override if (caddy_tls_override is defined) else (app.ingress.tls if (app.ingress is defined and app.ingress.tls is defined) else (caddy_tls_default | default(true))) %}
+{% set entry = (app.containers | default([]) | selectattr('entrypoint', 'defined') | selectattr('entrypoint') | list | first) %}
+{% set routed = (app.containers | default([]) | selectattr('proxy_paths', 'defined') | list) %}
+{% set static_paths = app.static_paths | default([]) %}
+{% set static_root_base = static_base_path | default('/srv/data/static') %}
+{% set domain_labels = [] %}
+{% for domain in domains %}
+{%   set domain_label = domain %}
+{%   if tls_mode == false %}
+{%     set domain_label = 'http://' + domain %}
+{%   endif %}
+{%   set _ = domain_labels.append(domain_label) %}
+{% endfor %}
+{{ domain_labels | join(', ') }} {
+{% if app_type == 'static' %}
+    root * {{ static_root_base }}/{{ app.name }}/public
+{% endif %}
+{% if app.ingress.caddy_directives is defined %}
+{{ app.ingress.caddy_directives }}
+{% elif app.ingress.extra_caddy is defined %}
+{{ app.ingress.extra_caddy }}
+{% endif %}
+{% if tls_mode == 'internal' %}
+    tls internal
+{% endif %}
+{% for static in static_paths %}
+{% if static.root is defined %}
+{%   if static.root.startswith('/') %}
+{%     set static_root = static.root %}
+{%   else %}
+{%     if static.root_base | default('app_public') == 'app_static' %}
+{%       set static_root = static_root_base ~ '/' ~ app.name ~ '/' ~ static.root %}
+{%     else %}
+{%       set static_root = static_root_base ~ '/' ~ app.name ~ '/public/' ~ static.root %}
+{%     endif %}
+{%   endif %}
+{% else %}
+{%   set static_root = static_root_base ~ '/' ~ app.name ~ '/public' %}
+{% endif %}
+{% if static.strip_prefix | default(true) %}
+    handle_path {{ static.path }} {
+        root * {{ static_root }}
+        file_server
+    }
+{% else %}
+    handle {{ static.path }} {
+        root * {{ static_root }}
+        file_server
+    }
+{% endif %}
+{% endfor %}
+{% if app_type == 'static' %}
+    file_server
+{% else %}
+{% for c in routed %}
+{% for route in c.proxy_paths %}
+{% set target_port = c.service_port | default((c.ports[0] if (c.ports is defined and (c.ports | length > 0)) else 8080)) %}
+{% if route.strip_prefix | default(true) %}
+    handle_path {{ route.path }} {
+        reverse_proxy {{ app.name }}-{{ c.name }}:{{ target_port }}
+    }
+{% else %}
+    handle {{ route.path }} {
+        reverse_proxy {{ app.name }}-{{ c.name }}:{{ target_port }}
+    }
+{% endif %}
+{% endfor %}
+{% endfor %}
+
+{% if entry is not none %}
+{% set entry_port = entry.service_port | default((entry.ports[0] if (entry.ports is defined and (entry.ports | length > 0)) else 8080)) %}
+    handle {
+        reverse_proxy {{ app.name }}-{{ entry.name }}:{{ entry_port }}
+    }
+{% else %}
+    respond "No entrypoint container configured for this domain." 502
+{% endif %}
+{% endif %}
+}

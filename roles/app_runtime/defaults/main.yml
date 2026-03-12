@@ -1,0 +1,22 @@
+---
+# Rootless Podman user and group
+podman_user: podman
+podman_group: podman
+
+# Enable systemd linger for podman_user so user services survive logout
+enable_linger: true
+
+# Base directory for all persistent data
+# (override in group_vars/all/main.yml)
+data_mount: "/srv/data"
+
+# Base directory for app data on each host
+app_data_base_path: "{{ data_mount }}/apps"
+
+# SSH hardening
+sshd_permit_root: "prohibit-password"
+sshd_allow_users: []
+
+# Additional host ports to allow through nftables.
+nftables_extra_tcp_ports: []
+nftables_extra_udp_ports: []

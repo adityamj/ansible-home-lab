@@ -1,0 +1,11 @@
+# Audit rules for system hardening
+# Monitor sudo usage
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/sudo -F key=sudo
+# Monitor SSH logins
+-w /var/log/auth.log -p wa -k auth
+# Monitor file changes in /etc
+-w /etc -p wa -k etc_changes
+# Monitor kernel module loading
+-w /sbin/modprobe -p x -k modprobe
+# Monitor changes to passwd
+-w /etc/passwd -p wa -k passwd_changes

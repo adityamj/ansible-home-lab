@@ -1,0 +1,33 @@
+[Unit]
+Description=Caddy web server (Podman Quadlet)
+
+[Container]
+ContainerName=caddy
+Image={{ caddy_image }}
+{% for net in host_ingress_networks %}Network={{ net }}
+{% endfor %}
+PublishPort=80:80
+PublishPort=443:443
+PublishPort=443:443/udp
+Volume={{ caddy_config_dir }}:/etc/caddy:rw,U,Z
+Volume={{ caddy_log_dir }}:/var/log/caddy:U,Z
+Volume={{ caddy_data_dir }}:/data:U,Z
+Volume={{ caddy_config_storage_dir }}:/config:U,Z
+Volume={{ static_base_path }}:/srv/data/static:ro,Z
+DropCapability=ALL
+AddCapability=NET_BIND_SERVICE
+NoNewPrivileges=true
+ReadOnly=true
+Tmpfs=/tmp:size=64m
+Tmpfs=/run:size=32m
+AutoUpdate=registry
+#Memory={{ caddy_memory_max | default('512M') }}
+
+[Service]
+Delegate=yes
+ExecReload=/usr/bin/podman exec caddy caddy reload --config /etc/caddy/Caddyfile
+CPUWeight={{ caddy_cpu_weight | default(2048) }}
+CPUQuota={{ caddy_cpu_quota | default('30%') }}
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,26 @@
+---
+# Podman user/group (should match app_runtime)
+podman_user: podman
+podman_group: podman
+
+# Base directory for all persistent data
+# (override in group_vars/all/main.yml)
+data_mount: "/srv/data"
+
+# Base directory for app data
+app_data_base_path: "{{ data_mount }}/apps"
+
+# Static files base path (read-only mount in Caddy)
+static_base_path: "{{ data_mount }}/static"
+
+# Caddy config directory for site configs
+caddy_config_dir: "{{ data_mount }}/system/ingress/caddy/config"
+
+# Caddy container image (for validation)
+caddy_image: "docker.io/library/caddy:2-alpine"
+
+# Caddy container user (for ownership fix)
+caddy_container_user: "0:0"
+
+# Optional: limit deployment to a single app
+# target_app: ""

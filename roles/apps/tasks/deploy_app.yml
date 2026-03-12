@@ -1,0 +1,194 @@
+---
+- name: Set app paths and networks
+  ansible.builtin.set_fact:
+    app_root: "{{ app.app_root | default(app_data_base_path + '/' + app.name) }}"
+    app_base_path: "{{ app.app_root | default(app_data_base_path + '/' + app.name) }}"
+    app_type: "{{ app.type | default('container') }}"
+    ingress_network_name: "{{ (app.pod | default({})).ingress_network | default(app.name + '-ingress-net') }}"
+    internal_network_name: "{{ (app.pod | default({})).internal_network | default('') }}"
+    requires_network: "{{ (app.containers | default([]) | length) > 0 }}"
+    app_domains: "{{ app.domains | default([]) + ([app.ingress.main_domain] if (app.ingress is defined and app.ingress.main_domain is defined and (app.domains | default([]) | length) == 0) else []) }}"
+
+- name: Expose base_data_path for container templates
+  ansible.builtin.set_fact:
+    base_data_path: "{{ app_base_path }}"
+
+- name: Set Caddy site paths
+  ansible.builtin.set_fact:
+    caddy_site_enabled_path: "{{ caddy_config_dir }}/sites-enabled/{{ app.name }}.caddy"
+
+- name: Ensure app base directory exists
+  ansible.builtin.file:
+    path: "{{ app_base_path }}"
+    state: directory
+    mode: "0755"
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Ensure app source path exists for this app
+  ansible.builtin.stat:
+    path: "{{ app_sources_root }}/apps/{{ app.name }}"
+  register: app_source_path_stat
+  delegate_to: localhost
+  become: false
+
+- name: Assert app source path resolved
+  ansible.builtin.assert:
+    that:
+      - app_source_path_stat.stat.exists
+      - app_source_path_stat.stat.isdir
+    fail_msg: >-
+      Unable to locate app sources for {{ app.name }} under
+      {{ app_sources_root }}/apps.
+  delegate_to: localhost
+  become: false
+
+- name: Ensure static public directory exists
+  ansible.builtin.file:
+    path: "{{ static_base_path | default('/srv/data/static') }}/{{ app.name }}/public"
+    state: directory
+    mode: "0755"
+  become: true
+  become_user: "{{ podman_user }}"
+  when:
+    - app_type == 'static' or (app.static_paths | default([]) | length) > 0
+
+- name: Ensure app ingress network exists
+  containers.podman.podman_network:
+    name: "{{ ingress_network_name }}"
+    state: present
+  become: true
+  become_user: "{{ podman_user }}"
+  when: requires_network
+
+- name: Ensure app internal network exists
+  containers.podman.podman_network:
+    name: "{{ internal_network_name }}"
+    state: present
+  become: true
+  become_user: "{{ podman_user }}"
+  when:
+    - requires_network
+    - internal_network_name | length > 0
+
+- name: Sort containers by priority
+  ansible.builtin.set_fact:
+    sorted_containers: "{{ app.containers | default([]) | map('combine', {'priority': 10}) | list | sort(attribute='priority', reverse=false) }}"
+  when: requires_network
+
+- name: Configure containers for app
+  ansible.builtin.include_tasks: configure_container.yml
+  loop: "{{ sorted_containers }}"
+  loop_control:
+    loop_var: container
+    label: "{{ container.name }}"
+  when:
+    - requires_network
+    - (sorted_containers | length) > 0
+
+- name: Find existing Quadlet container files for app
+  ansible.builtin.shell: >-
+    grep -rlE "^Description={{ app.name | regex_escape }} - "
+    "/home/{{ podman_user }}/.config/containers/systemd"
+    --include="*.container" |
+    awk -v app="{{ app.name }}" -F/ '
+      {
+        n = $NF
+        sub("^" app "-", "", n)
+        sub(/\.container$/, "", n)
+        print n
+      }
+    '
+  args:
+    executable: /bin/bash
+  register: existing_container_names_cmd
+  changed_when: false
+  failed_when: false
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Build desired and existing container lists for app
+  ansible.builtin.set_fact:
+    desired_container_names: "{{ app.containers | default([]) | map(attribute='name') | list }}"
+    existing_container_names: "{{ existing_container_names_cmd.stdout_lines | default([]) }}"
+
+- name: Compute stale container names for app
+  ansible.builtin.set_fact:
+    stale_container_names: "{{ existing_container_names | difference(desired_container_names) }}"
+
+- name: Stop and disable stale app services
+  ansible.builtin.systemd:
+    name: "{{ app.name }}-{{ item }}.service"
+    state: stopped
+    enabled: false
+    scope: user
+  loop: "{{ stale_container_names | default([]) }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  failed_when: false
+  when: (stale_container_names | default([]) | length) > 0
+
+- name: Remove stale Quadlet container files
+  ansible.builtin.file:
+    path: "/home/{{ podman_user }}/.config/containers/systemd/{{ app.name }}-{{ item }}.container"
+    state: absent
+  loop: "{{ stale_container_names | default([]) }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  register: stale_quadlet_remove_results
+  when: (stale_container_names | default([]) | length) > 0
+
+- name: Track stale Quadlet removals
+  ansible.builtin.set_fact:
+    quadlet_units_changed: >-
+      {{
+        quadlet_units_changed | default(false)
+        or (
+          stale_quadlet_remove_results.results | default([])
+          | selectattr('changed')
+          | list
+          | length > 0
+        )
+      }}
+  when: stale_quadlet_remove_results is defined
+
+- name: Remove stale Podman containers
+  ansible.builtin.command: "podman rm -f {{ app.name }}-{{ item }}"
+  loop: "{{ stale_container_names | default([]) }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: stale_container_remove_results
+  failed_when: false
+  changed_when: false
+  when: (stale_container_names | default([]) | length) > 0
+
+- name: Render Caddy site config (enabled)
+  ansible.builtin.template:
+    src: "caddy_site.caddy.j2"
+    dest: "{{ caddy_site_enabled_path }}"
+    mode: "0644"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: app_domains | length > 0
+  register: caddy_site_enabled
+
+- name: Remove enabled site when no domains defined
+  ansible.builtin.file:
+    path: "{{ caddy_site_enabled_path }}"
+    state: absent
+  become: true
+  become_user: "{{ podman_user }}"
+  when: app_domains | length == 0
+  register: caddy_site_enabled_removed
+
+- name: Track whether Caddy config changed for this app
+  ansible.builtin.set_fact:
+    caddy_config_changed: >-
+      {{
+        (caddy_config_changed | default(false))
+        or (caddy_site_enabled is defined and caddy_site_enabled.changed | default(false))
+        or (caddy_site_enabled_removed is defined and caddy_site_enabled_removed.changed | default(false))
+      }}
+  when: app_domains | length >= 0

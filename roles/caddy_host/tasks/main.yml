@@ -1,0 +1,126 @@
+---
+- name: Collect Caddy directories
+  ansible.builtin.set_fact:
+    caddy_directories:
+      - "{{ caddy_config_dir }}"
+      - "{{ caddy_config_dir }}/sites-enabled"
+      - "{{ caddy_config_dir }}/snippets"
+      - "{{ static_base_path }}"
+      - "{{ caddy_data_dir }}"
+      - "{{ caddy_config_storage_dir }}"
+      - "{{ caddy_log_dir }}"
+
+- name: Ensure Caddy directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "0755"
+  loop: "{{ caddy_directories }}"
+  loop_control:
+    label: "{{ item }}"
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Discover apps and build host data
+  ansible.builtin.include_tasks: ../common/tasks/app_discovery.yml
+  when: host_ingress_networks is not defined
+
+- name: Prepare podman user systemd runtime
+  ansible.builtin.include_tasks: ../common/tasks/podman_user_systemd.yml
+
+- name: Seed default snippet placeholder
+  ansible.builtin.copy:
+    dest: "{{ caddy_config_dir }}/snippets/00-placeholder.caddy"
+    content: |
+      # Default snippet placeholder. Add shared snippets to this directory.
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "0644"
+    force: false
+  register: snippet_placeholder_result
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Deploy Caddyfile
+  ansible.builtin.template:
+    src: "Caddyfile.j2"
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "0644"
+  register: caddyfile_template
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Ensure per-app networks exist for Caddy
+  containers.podman.podman_network:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ host_ingress_networks }}"
+  when: host_ingress_networks | length > 0
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Deploy Caddy Quadlet file
+  ansible.builtin.template:
+    src: "caddy.container.j2"
+    dest: "/home/{{ podman_user }}/.config/containers/systemd/caddy.container"
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "0644"
+  register: caddy_quadlet_template
+  become: true
+  become_user: "{{ podman_user }}"
+
+- name: Reload systemd user daemon for podman user
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+
+- name: Set Caddy unit name
+  ansible.builtin.set_fact:
+    caddy_unit_name: caddy.service
+
+- name: Enable and start Caddy service
+  ansible.builtin.systemd:
+    name: "{{ caddy_unit_name }}"
+    state: started
+    enabled: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+- name: Track Caddy global config changes
+  ansible.builtin.set_fact:
+    caddy_global_config_changed: >-
+      {{
+        (caddy_global_config_changed | default(false))
+        or (snippet_placeholder_result.changed | default(false))
+        or (caddyfile_template.changed | default(false))
+      }}
+    caddy_service_restart_needed: >-
+      {{
+        (caddy_service_restart_needed | default(false))
+        or (caddy_quadlet_template.changed | default(false))
+      }}
+
+- name: Verify Caddy config directory ownership
+  ansible.builtin.stat:
+    path: "{{ caddy_config_dir }}"
+  register: caddy_config_dir_stat
+
+- name: Assert Caddy config directory owned by podman user
+  ansible.builtin.assert:
+    that:
+      - caddy_config_dir_stat.stat.exists
+      - caddy_config_dir_stat.stat.uid | int != 0
+      - caddy_config_dir_stat.stat.gid | int != 0
+    fail_msg: >-
+      Caddy config dir {{ caddy_config_dir }} must be owned by a non-root user.

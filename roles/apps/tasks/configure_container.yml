@@ -1,0 +1,428 @@
+---
+- name: Validate volume definitions
+  ansible.builtin.assert:
+    that:
+      - vol.host_path is defined or vol.name is defined
+    fail_msg: "Volume must define either host_path or name: {{ vol }}"
+  loop: "{{ container.volumes | default([]) }}"
+  loop_control:
+    loop_var: vol
+
+- name: Build resolved volumes with host paths
+  ansible.builtin.set_fact:
+    resolved_volumes: []
+
+- name: Build resolved mounts list
+  ansible.builtin.set_fact:
+    resolved_mounts: []
+
+- name: Resolve volume host paths
+  ansible.builtin.set_fact:
+    resolved_volumes: "{{ resolved_volumes + [ vol | combine({'host_path': vol.host_path | default(app_base_path + '/' + vol.name, true)}) ] }}"
+  loop: "{{ container.volumes | default([]) }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.name | default(vol.host_path, true) }}"
+  when: container.volumes is defined
+
+- name: Ensure volume directories exist
+  ansible.builtin.file:
+    path: "{{ vol.host_path }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ resolved_volumes | default([]) }}"
+  loop_control:
+    loop_var: vol
+    label: "{{ vol.host_path }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: container.volumes is defined
+
+- name: Validate mounts definitions
+  ansible.builtin.assert:
+    that:
+      - mnt.container_path is defined
+      - mnt.relative_path is defined
+    fail_msg: "Mount must define container_path and relative_path: {{ mnt }}"
+  loop: "{{ container.mounts | default([]) }}"
+  loop_control:
+    loop_var: mnt
+  when: container.mounts is defined
+
+- name: Build resolved mounts
+  ansible.builtin.set_fact:
+    resolved_mounts: >-
+      {%- set items = resolved_mounts | default([]) -%}
+      {%- for mnt in container.mounts | default([]) -%}
+      {%-   set src_candidate = (
+              mnt.src
+              | default('apps/' ~ app.name ~ '/files/' ~ mnt.relative_path)
+              | replace('{{ container.name }}', container.name)
+            ) -%}
+      {%-   set src_absolute = (src_candidate if src_candidate.startswith('/') else app_sources_root + '/' + src_candidate) -%}
+      {%-   set _ = items.append(
+              mnt
+              | combine(
+                  {
+                    'host_path': mnt.host_path | default(app_base_path + '/' + mnt.relative_path, true),
+                    'src_resolved': src_candidate,
+                    'src_absolute': src_absolute
+                  },
+                  recursive=True
+                )
+            ) -%}
+      {%- endfor -%}
+      {{ items }}
+  when: container.mounts is defined
+
+- name: Ensure mount parent directories exist
+  ansible.builtin.file:
+    path: "{{ mnt.host_path | dirname }}"
+    state: directory
+    mode: "{{ mnt.directory_mode | default('0755') }}"
+  loop: "{{ resolved_mounts | default([]) }}"
+  loop_control:
+    loop_var: mnt
+    label: "{{ mnt.host_path | dirname | default('skipped') }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when:
+    - container.mounts is defined
+    - (resolved_mounts | default([]) | length) > 0
+
+- name: Check mount source paths
+  ansible.builtin.stat:
+    path: "{{ mnt.src_absolute }}"
+  loop: "{{ resolved_mounts | default([]) }}"
+  loop_control:
+    loop_var: mnt
+    label: "{{ mnt.src_absolute }}"
+  register: mount_source_stats
+  delegate_to: localhost
+  become: false
+  when:
+    - resolved_mounts is defined
+    - (resolved_mounts | default([]) | length) > 0
+    - mnt.content is not defined
+
+- name: Normalize mount source results
+  ansible.builtin.set_fact:
+    mount_source_results: "{{ mount_source_stats.results | default([]) | selectattr('mnt', 'defined') | list }}"
+  when: mount_source_stats is defined
+
+- name: Split directory and file mounts
+  ansible.builtin.set_fact:
+    dir_mounts: "{{ mount_source_results | json_query('[?stat.isdir==`true`].mnt') }}"
+    file_mounts: "{{ mount_source_results | json_query('[?stat.isdir==`false`].mnt') }}"
+  when: mount_source_results is defined
+
+- name: Copy directory mounts to host path
+  ansible.builtin.copy:
+    src: "{{ item.src_absolute }}/"
+    dest: "{{ item.host_path }}"
+    mode: "{{ item.mode | default('0644') }}"
+  loop: "{{ dir_mounts | default([]) }}"
+  loop_control:
+    label: "{{ item.host_path }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: dir_mounts | default([]) | length > 0
+  register: mount_copy_dir_results
+
+- name: Copy file mounts to host path
+  ansible.builtin.copy:
+    src: "{{ mnt.src_absolute }}"
+    dest: "{{ mnt.host_path }}"
+    mode: "{{ mnt.mode | default('0644') }}"
+  loop: "{{ file_mounts | default([]) }}"
+  loop_control:
+    loop_var: mnt
+    label: "{{ mnt.host_path }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: file_mounts | default([]) | length > 0
+  register: mount_copy_results
+
+- name: Collect content mounts
+  ansible.builtin.set_fact:
+    content_mounts: "{{ resolved_mounts | default([]) | selectattr('content', 'defined') | list }}"
+  when: resolved_mounts is defined and (resolved_mounts | default([]) | length) > 0
+
+- name: Copy content mounts to host path
+  ansible.builtin.copy:
+    content: "{{ mnt.content }}"
+    dest: "{{ mnt.host_path }}"
+    mode: "{{ mnt.mode | default('0644') }}"
+  loop: "{{ content_mounts | default([]) }}"
+  loop_control:
+    loop_var: mnt
+    label: "{{ mnt.host_path }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: content_mounts | default([]) | length > 0
+  register: mount_copy_content_results
+
+- name: Track whether mount content changed for this container
+  ansible.builtin.set_fact:
+    container_mounts_changed: >-
+      {{
+        (
+          (mount_copy_dir_results.results | default([]))
+          + (mount_copy_results.results | default([]))
+          + (mount_copy_content_results.results | default([]))
+        )
+        | selectattr('changed')
+        | list
+        | length > 0
+      }}
+
+- name: Merge secret env overrides for this app/container (if any)
+  ansible.builtin.set_fact:
+    merged_env: "{{ (container.env | default({})) | combine(vault_app_env_overrides[app.name] | default({}), recursive=True) }}"
+  no_log: true
+
+- name: Initialize per-container secret state
+  ansible.builtin.set_fact:
+    container_secrets: []
+    resolved_secrets: []
+    secret_values: {}
+    desired_secret_hashes: {}
+    existing_secret_hashes: {}
+    secrets_to_reconcile: []
+    container_secrets_changed: false
+
+- name: Collect declared container secrets
+  ansible.builtin.set_fact:
+    container_secrets: "{{ container.secrets | default([]) }}"
+
+- name: Validate secret definitions
+  ansible.builtin.assert:
+    that:
+      - sec.name is defined
+      - (sec.name | string | length) > 0
+      - (sec.type | default('mount')) in ['mount', 'env']
+    fail_msg: "Secret must define name and optional type in [mount, env]: {{ sec }}"
+  loop: "{{ container_secrets }}"
+  loop_control:
+    loop_var: sec
+  when: container_secrets | length > 0
+
+- name: Build resolved secret specs
+  ansible.builtin.set_fact:
+    resolved_secrets: "{{ (resolved_secrets | default([])) + [sec | combine({'type': sec.type | default('mount'), 'target': sec.target | default((sec.name) if ((sec.type | default('mount')) == 'env') else ('/run/secrets/' ~ sec.name), true), 'hash_path': '/home/' ~ podman_user ~ '/.config/containers/secrets-hashes/' ~ app.name ~ '-' ~ container.name ~ '-' ~ sec.name ~ '.sha256'}, recursive=True)] }}"
+  loop: "{{ container_secrets }}"
+  loop_control:
+    loop_var: sec
+  when: container_secrets | length > 0
+
+- name: Ensure secret values exist for declared secrets
+  ansible.builtin.assert:
+    that:
+      - vault_podman_secrets is defined
+      - vault_podman_secrets[app.name] is defined
+      - vault_podman_secrets[app.name][sec.name] is defined
+    fail_msg: >-
+      Missing secret value for {{ app.name }}/{{ sec.name }}.
+      Define vault_podman_secrets.{{ app.name }}.{{ sec.name }} in vaulted vars.
+  loop: "{{ resolved_secrets | default([]) }}"
+  loop_control:
+    loop_var: sec
+  no_log: true
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Ensure secret hash pepper is configured
+  ansible.builtin.assert:
+    that:
+      - vault_secret_hash_pepper is defined
+      - (vault_secret_hash_pepper | string | length) > 0
+    fail_msg: >-
+      Missing vault_secret_hash_pepper in vaulted vars.
+      Define a global pepper in group_vars/all/vault.yml before deploying secrets.
+  no_log: true
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Build secret value map
+  ansible.builtin.set_fact:
+    secret_values: "{{ (secret_values | default({})) | combine({sec.name: vault_podman_secrets[app.name][sec.name]}, recursive=True) }}"
+  loop: "{{ resolved_secrets | default([]) }}"
+  loop_control:
+    loop_var: sec
+  no_log: true
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Build desired secret hash map
+  ansible.builtin.set_fact:
+    desired_secret_hashes: >-
+      {{
+        (desired_secret_hashes | default({}))
+        | combine(
+            {
+              item.key: 'v2:' ~ ({'app': app.name, 'secret': item.key, 'pepper': vault_secret_hash_pepper, 'value': item.value} | to_json | hash('sha256'))
+            },
+            recursive=True
+          )
+      }}
+  loop: "{{ (secret_values | default({})) | dict2items }}"
+  no_log: true
+  when: (secret_values | default({}) | length) > 0
+
+- name: Ensure secret hash directory exists
+  ansible.builtin.file:
+    path: "/home/{{ podman_user }}/.config/containers/secrets-hashes"
+    state: directory
+    mode: "0700"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Read existing secret hash files
+  ansible.builtin.slurp:
+    src: "{{ item.hash_path }}"
+  loop: "{{ resolved_secrets | default([]) }}"
+  register: secret_hash_slurp
+  failed_when: false
+  become: true
+  become_user: "{{ podman_user }}"
+  no_log: true
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Build existing secret hash map
+  ansible.builtin.set_fact:
+    existing_secret_hashes: "{{ (existing_secret_hashes | default({})) | combine({item.item.name: ((item.content | b64decode | trim) if (item.content is defined) else '')}, recursive=True) }}"
+  loop: "{{ secret_hash_slurp.results | default([]) }}"
+  no_log: true
+  when: (resolved_secrets | default([]) | length) > 0
+
+- name: Compute secrets requiring reconciliation
+  ansible.builtin.set_fact:
+    secrets_to_reconcile: "{{ (secrets_to_reconcile | default([])) + [sec] }}"
+  loop: "{{ resolved_secrets | default([]) }}"
+  loop_control:
+    loop_var: sec
+  when:
+    - (resolved_secrets | default([]) | length) > 0
+    - (existing_secret_hashes | default({})).get(sec.name, '') != (desired_secret_hashes | default({})).get(sec.name, '')
+
+- name: Remove stale podman secret before recreate
+  ansible.builtin.command: "podman secret rm {{ sec.name }}"
+  loop: "{{ secrets_to_reconcile | default([]) }}"
+  loop_control:
+    loop_var: sec
+  register: podman_secret_rm
+  failed_when: podman_secret_rm.rc != 0 and ('no such secret' not in (podman_secret_rm.stderr | default('') | lower))
+  changed_when: podman_secret_rm.rc == 0
+  become: true
+  become_user: "{{ podman_user }}"
+  no_log: true
+  when: (secrets_to_reconcile | default([]) | length) > 0
+
+- name: Create podman secret from vaulted value
+  ansible.builtin.command: "podman secret create {{ sec.name }} -"
+  args:
+    stdin: "{{ secret_values[sec.name] }}"
+    stdin_add_newline: false
+  loop: "{{ secrets_to_reconcile | default([]) }}"
+  loop_control:
+    loop_var: sec
+  become: true
+  become_user: "{{ podman_user }}"
+  no_log: true
+  when: (secrets_to_reconcile | default([]) | length) > 0
+
+- name: Persist secret hash marker
+  ansible.builtin.copy:
+    content: "{{ desired_secret_hashes[sec.name] }}\n"
+    dest: "{{ sec.hash_path }}"
+    mode: "0600"
+  loop: "{{ secrets_to_reconcile | default([]) }}"
+  loop_control:
+    loop_var: sec
+  become: true
+  become_user: "{{ podman_user }}"
+  no_log: true
+  when: (secrets_to_reconcile | default([]) | length) > 0
+
+- name: Track whether secrets changed for this container
+  ansible.builtin.set_fact:
+    container_secrets_changed: "{{ (secrets_to_reconcile | default([]) | length) > 0 }}"
+
+- name: Resolve container networks
+  ansible.builtin.set_fact:
+    container_networks: "{{ container.networks | default([ingress_network_name], true) }}"
+
+- name: Initialize published port list
+  ansible.builtin.set_fact:
+    container_published_ports: []
+
+- name: Validate published port definitions
+  ansible.builtin.assert:
+    that:
+      - pub.host_port is defined
+      - pub.container_port is defined
+      - (pub.host_port | int) > 0
+      - (pub.host_port | int) < 65536
+      - (pub.container_port | int) > 0
+      - (pub.container_port | int) < 65536
+      - (pub.protocol | default('tcp')) in ['tcp', 'udp']
+    fail_msg: "published_ports entries must define valid host_port/container_port and optional protocol tcp|udp: {{ pub }}"
+  loop: "{{ container.published_ports | default([]) }}"
+  loop_control:
+    loop_var: pub
+    label: "{{ pub.host_port | default('missing') }}->{{ pub.container_port | default('missing') }}"
+  when: container.published_ports is defined
+
+- name: Build normalized published port list
+  ansible.builtin.set_fact:
+    container_published_ports: "{{ container_published_ports + [pub | combine({'host_port': (pub.host_port | int), 'container_port': (pub.container_port | int), 'protocol': (pub.protocol | default('tcp'))}, recursive=True)] }}"
+  loop: "{{ container.published_ports | default([]) }}"
+  loop_control:
+    loop_var: pub
+    label: "{{ pub.host_port }}->{{ pub.container_port }}"
+  when: container.published_ports is defined
+
+- name: Replace ingress network placeholder
+  ansible.builtin.set_fact:
+    container_networks: "{{ container_networks | map('replace', '{{ pod.ingress_network }}', ingress_network_name) | list }}"
+
+- name: Replace internal network placeholder
+  ansible.builtin.set_fact:
+    container_networks: "{{ container_networks | map('replace', '{{ pod.internal_network }}', internal_network_name) | list }}"
+  when: internal_network_name | length > 0
+
+- name: Remove empty network entries
+  ansible.builtin.set_fact:
+    container_networks: "{{ container_networks | reject('equalto', '') | list }}"
+
+- name: Ensure container networks exist
+  containers.podman.podman_network:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ container_networks | default([]) }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  when: (container_networks | default([]) | length) > 0
+
+- name: Render Quadlet for app container
+  ansible.builtin.template:
+    src: "quadlet/app.container.j2"
+    dest: "/home/{{ podman_user }}/.config/containers/systemd/{{ app.name }}-{{ container.name }}.container"
+    mode: "0644"
+  become: true
+  become_user: "{{ podman_user }}"
+  vars:
+    app: "{{ app }}"
+    container: "{{ container | combine({'env': merged_env}) }}"
+    volumes: "{{ resolved_volumes | default([]) }}"
+    mounts: "{{ resolved_mounts | default([]) }}"
+    container_networks: "{{ container_networks }}"
+    container_published_ports: "{{ container_published_ports | default([]) }}"
+  register: quadlet_template_result
+
+- name: Track app services requiring restart
+  ansible.builtin.set_fact:
+    app_services_to_restart: "{{ (app_services_to_restart | default([])) + [app.name ~ '-' ~ container.name ~ '.service'] }}"
+    quadlet_units_changed: true
+  when:
+    - quadlet_template_result.changed | default(false)
+      or (container_mounts_changed | default(false))
+      or (container_secrets_changed | default(false))

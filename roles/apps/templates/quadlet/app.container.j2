@@ -1,0 +1,59 @@
+[Unit]
+Description={{ app.name }} - {{ container.name }} (Podman Quadlet)
+{% if container.depends_on is defined and container.depends_on %}
+Requires={% for dep in container.depends_on %}{{ app.name }}-{{ dep }}.service {% endfor %}
+After={% for dep in container.depends_on %}{{ app.name }}-{{ dep }}.service {% endfor %}
+{% endif %}
+
+[Container]
+ContainerName={{ app.name }}-{{ container.name }}
+Image={{ container.image }}
+{% if container.user is defined %}
+User={{ container.user }}
+{% endif %}
+{% if container.command is defined %}
+Exec={{ container.command if container.command is string else container.command | join(' ') }}
+{% endif %}
+{% for net in container_networks | default([]) %}
+Network={{ net }}
+{% endfor %}
+{% for vol in volumes | default([]) %}
+Volume={{ vol.host_path }}:{{ vol.container_path }}:U,Z
+{% endfor %}
+{% for mnt in mounts | default([]) %}
+Volume={{ mnt.host_path }}:{{ mnt.container_path }}:ro,U,Z
+{% endfor %}
+{% for pub in container_published_ports | default([]) %}
+{% if pub.host_ip is defined and (pub.host_ip | string | length) > 0 %}
+PublishPort={{ pub.host_ip }}:{{ pub.host_port }}:{{ pub.container_port }}{% if (pub.protocol | default('tcp')) != 'tcp' %}/{{ pub.protocol }}{% endif %}{{ '\n' }}
+{% else %}
+PublishPort={{ pub.host_port }}:{{ pub.container_port }}{% if (pub.protocol | default('tcp')) != 'tcp' %}/{{ pub.protocol }}{% endif %}{{ '\n' }}
+{% endif %}
+{% endfor %}
+{% for sec in (container.secrets | default([])) %}
+{% set sec_type = sec.type | default('mount') %}
+{% if sec_type == 'env' %}
+{% set sec_target = sec.target | default(sec.name) %}
+{% else %}
+{% set sec_target = sec.target | default('/run/secrets/' ~ sec.name) %}
+{% endif %}
+Secret={{ sec.name }},type={{ sec_type }},target={{ sec_target }}{{ '\n' }}
+{% endfor %}
+{% for key, val in (container.env | default({})).items() %}
+Environment={{ key }}={{ val }}{{ '\n' }}
+{% endfor %}
+DropCapability=ALL
+AddCapability=NET_BIND_SERVICE
+NoNewPrivileges=true
+ReadOnly=true
+#Memory={{ container.memory_max | default('128M') }}
+Tmpfs=/tmp:size=64m
+Tmpfs=/run:size=32m
+AutoUpdate=registry
+
+[Service]
+CPUWeight={{ container.cpu_shares | default(1024) }}
+CPUQuota={{ container.cpu_quota | default('10%') }}
+
+[Install]
+WantedBy=default.target

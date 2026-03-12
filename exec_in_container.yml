@@ -1,0 +1,41 @@
+---
+- name: Run a command inside an app container
+  hosts: homelab_servers
+  become: true
+
+  vars:
+    target_app: "{{ target_app }}"
+    target_container: "{{ target_container }}"
+    exec_cmd: "{{ exec_cmd | default('echo hello') }}"
+
+  tasks:
+    - name: Find the app object
+      ansible.builtin.set_fact:
+        app_obj: "{{ (apps | selectattr('name', 'equalto', target_app) | list | first) | default(None) }}"
+
+    - name: Resolve assigned apps for this host
+      ansible.builtin.set_fact:
+        assigned_apps: "{{ hostvars[inventory_hostname].assigned_apps | default([]) }}"
+
+    - name: Decide if host manages target app
+      ansible.builtin.set_fact:
+        host_handles_app: "{{ target_app in assigned_apps }}"
+
+    - name: Skip hosts not responsible for this app
+      ansible.builtin.meta: end_host
+      when: not host_handles_app
+
+    - name: Run command in the container
+      ansible.builtin.shell: >
+        runuser -l {{ podman_user }} -c
+        'podman exec {{ target_app }}-{{ target_container }} {{ exec_cmd }}'
+      register: exec_out
+      changed_when: false
+
+    - name: Show command output
+      ansible.builtin.debug:
+        msg: |
+          STDOUT:
+          {{ exec_out.stdout | default('') }}
+          STDERR:
+          {{ exec_out.stderr | default('') }}

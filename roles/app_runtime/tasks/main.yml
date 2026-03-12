@@ -1,0 +1,267 @@
+---
+- name: Fail if not Debian
+  ansible.builtin.fail:
+    msg: "This role currently supports Debian only."
+  when: ansible_facts.distribution != "Debian"
+
+- name: Update apt cache and upgrade system
+  ansible.builtin.apt:
+    update_cache: yes
+    upgrade: dist
+    autoremove: yes
+    autoclean: yes
+
+- name: Install all required packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg2
+      - ca-certificates
+      - nftables
+      - podman
+      - uidmap
+      - slirp4netns
+      - fuse-overlayfs
+      - fail2ban
+      - unattended-upgrades
+      - apparmor
+      - apparmor-utils
+    state: present
+
+- name: Ensure podman user exists
+  ansible.builtin.user:
+    name: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    create_home: yes
+
+- name: Ensure subuid and subgid ranges for podman user
+  ansible.builtin.lineinfile:
+    path: "{{ item.path }}"
+    regexp: "^{{ podman_user }}:"
+    line: "{{ podman_user }}:100000:65536"
+    create: true
+    mode: "0644"
+  loop:
+    - { path: /etc/subuid }
+    - { path: /etc/subgid }
+
+- name: Check linger status
+  ansible.builtin.stat:
+    path: "/var/lib/systemd/linger/{{ podman_user }}"
+  register: linger_file
+
+- name: Enable linger for podman user
+  ansible.builtin.command: "loginctl enable-linger {{ podman_user }}"
+  when: not linger_file.stat.exists
+
+- name: Ensure required directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "{{ '0700' if '/run/user' in item else '0755' }}"
+  loop:
+    - "{{ app_data_base_path }}"
+    - "/home/{{ podman_user }}/.config/containers"
+    - "/home/{{ podman_user }}/.local/share/containers"
+    - "/home/{{ podman_user }}/.config/containers/systemd"
+    - "/home/{{ podman_user }}/.config/containers/networks"
+
+- name: Ensure SSH config directories exist
+  ansible.builtin.file:
+    path: /etc/ssh/sshd_config.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy SSH hardening drop-in
+  ansible.builtin.template:
+    src: ssh_hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/99-ansible-hardening.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart ssh
+
+- name: Capture podman user UID
+  ansible.builtin.command: "id -u {{ podman_user }}"
+  register: podman_uid
+  changed_when: false
+
+- name: Ensure runtime dir and start systemd user manager
+  block:
+    - name: Ensure runtime dir exists
+      ansible.builtin.file:
+        path: "/run/user/{{ podman_uid.stdout }}"
+        state: directory
+        owner: "{{ podman_user }}"
+        group: "{{ podman_group }}"
+        mode: "0700"
+
+    - name: Check systemd user manager status
+      ansible.builtin.command: "systemctl is-active user@{{ podman_uid.stdout }}.service"
+      register: podman_user_manager_status
+      changed_when: false
+      failed_when: false
+
+    - name: Start systemd user manager
+      ansible.builtin.systemd:
+        name: "user@{{ podman_uid.stdout }}.service"
+        state: started
+      when: podman_user_manager_status.stdout | trim != 'active'
+
+- name: Enable Podman auto-update timer
+  ansible.builtin.systemd:
+    name: podman-auto-update.timer
+    enabled: true
+    scope: user
+  become: yes
+  become_user: "{{ podman_user }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ podman_uid.stdout }}"
+
+- name: Allow unprivileged port binding
+  ansible.builtin.sysctl:
+    name: net.ipv4.ip_unprivileged_port_start
+    value: "79"
+    state: present
+    sysctl_file: /etc/sysctl.d/99-unprivileged-ports.conf
+    reload: true
+
+- name: Stop and disable UFW if present
+  ansible.builtin.systemd:
+    name: ufw
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Purge UFW to avoid netavark conflicts
+  ansible.builtin.apt:
+    name: ufw
+    state: absent
+    purge: true
+    autoremove: true
+
+- name: Deploy nftables ruleset
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nftables
+
+- name: Enable and start nftables
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
+
+- name: Enable and start AppArmor
+  ansible.builtin.systemd:
+    name: apparmor
+    state: started
+    enabled: true
+
+- name: Enforce AppArmor profiles
+  ansible.builtin.command: "aa-enforce /etc/apparmor.d/*"
+  ignore_errors: true
+  changed_when: false
+
+- name: Configure and enable unattended-upgrades
+  block:
+    - name: Configure unattended-upgrades
+      ansible.builtin.template:
+        src: unattended-upgrades.j2
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable and start unattended-upgrades
+      ansible.builtin.systemd:
+        name: unattended-upgrades
+        state: started
+        enabled: true
+
+- name: Configure and enable fail2ban
+  block:
+    - name: Configure fail2ban
+      ansible.builtin.template:
+        src: jail.local.j2
+        dest: /etc/fail2ban/jail.local
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart fail2ban after config
+
+    - name: Enable and start fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        state: started
+        enabled: true
+
+- name: Apply sysctl hardening
+  ansible.builtin.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: /etc/sysctl.d/99-ansible-hardening.conf
+    reload: true
+  loop:
+    - { name: 'kernel.kptr_restrict', value: '1' }
+    - { name: 'kernel.dmesg_restrict', value: '1' }
+    - { name: 'kernel.perf_event_paranoid', value: '3' }
+    - { name: 'vm.swappiness', value: '10' }
+    - { name: 'net.ipv4.tcp_syncookies', value: '1' }
+    - { name: 'net.ipv4.conf.all.accept_redirects', value: '0' }
+    - { name: 'net.ipv4.conf.default.accept_redirects', value: '0' }
+    - { name: 'net.ipv6.conf.all.accept_redirects', value: '0' }
+    - { name: 'net.ipv6.conf.default.accept_redirects', value: '0' }
+    - { name: 'net.ipv4.conf.all.send_redirects', value: '0' }
+    - { name: 'net.ipv4.conf.default.send_redirects', value: '0' }
+
+- name: Secure /tmp mount
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: '^.* /tmp .*'
+    line: "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0"
+    create: false
+  register: tmp_fstab_hardening
+
+- name: Remount /tmp with hardened options
+  ansible.builtin.command: mount -o remount,noexec,nosuid,nodev /tmp
+  when: tmp_fstab_hardening.changed
+
+- name: Validate and enforce data mount ownership
+  become: true
+  block:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - data_mount is defined
+          - podman_user is defined
+          - podman_group is defined
+          - data_mount | length > 1
+          - data_mount.startswith('/')
+          - data_mount != '/'
+        fail_msg: "data_mount/podman_user/podman_group are invalid or unsafe."
+    - name: Check data_mount path exists
+      ansible.builtin.stat:
+        path: "{{ data_mount }}"
+      register: data_mount_stat
+    - name: Ensure data_mount exists and is a directory
+      ansible.builtin.assert:
+        that:
+          - data_mount_stat.stat.exists
+          - data_mount_stat.stat.isdir
+        fail_msg: "data_mount '{{ data_mount }}' must exist and be a directory."
+    - name: Ensure base directory ownership
+      ansible.builtin.file:
+        path: "{{ data_mount }}"
+        state: directory
+        owner: "{{ podman_user }}"
+        group: "{{ podman_group }}"
+        mode: "0755"

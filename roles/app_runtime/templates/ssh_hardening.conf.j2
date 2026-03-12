@@ -1,0 +1,15 @@
+# Managed by Ansible - SSH hardening
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitRootLogin {{ sshd_permit_root }}
+AuthenticationMethods publickey
+LoginGraceTime 30
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
+X11Forwarding no
+{% if sshd_allow_users | length > 0 %}
+AllowUsers {{ sshd_allow_users | join(' ') }}
+{% endif %}

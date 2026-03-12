@@ -1,0 +1,5 @@
+RESTIC_REPOSITORY={{ vault_restic_repository }}
+RESTIC_PASSWORD={{ vault_restic_password }}
+{% for key, val in vault_restic_env_extra.items() %}
+{{ key }}={{ val }}
+{% endfor %}

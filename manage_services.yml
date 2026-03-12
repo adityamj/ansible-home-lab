@@ -1,0 +1,45 @@
+---
+- name: Manage Podman app services via systemd user units
+  hosts: homelab_servers
+  become: true
+
+  vars:
+    target_app: "{{ target_app }}"
+    target_state: "{{ target_state | default('restart') }}"
+
+  tasks:
+    - name: Build podman user systemd environment
+      ansible.builtin.include_tasks: roles/common/tasks/podman_user_systemd.yml
+
+    - name: Load app definitions
+      ansible.builtin.set_fact:
+        app_obj: "{{ (apps | selectattr('name', 'equalto', target_app) | list | first) | default(None) }}"
+
+    - name: Resolve assigned apps for this host
+      ansible.builtin.set_fact:
+        assigned_apps: "{{ hostvars[inventory_hostname].assigned_apps | default([]) }}"
+
+    - name: Decide if host manages target app
+      ansible.builtin.set_fact:
+        host_handles_app: "{{ target_app in assigned_apps }}"
+
+    - name: Skip hosts not responsible for this app
+      ansible.builtin.meta: end_host
+      when: not host_handles_app
+
+    - name: Reload systemd user daemon before service management
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: false
+      when: (app_obj.containers | default([]) | length) > 0
+
+    - name: Manage all containers for this app on this host
+      ansible.builtin.shell: |
+        {% for container in app_obj.containers %}
+        runuser -l {{ podman_user }} -c 'XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u {{ podman_user }})} systemctl --user {{ target_state }} {{ app_obj.name }}-{{ container.name }}.service'
+        {% endfor %}
+      changed_when: true

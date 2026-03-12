@@ -1,0 +1,32 @@
+---
+# Podman user/group (should match app_runtime)
+podman_user: podman
+podman_group: podman
+
+# Caddy container image
+caddy_image: "docker.io/library/caddy:2-alpine"
+
+# Caddy container user (UID:GID inside container, for ownership)
+# Official Caddy image runs as root by default
+caddy_container_user: "0:0"
+
+# Base directory for all persistent data
+# (override in group_vars/all/main.yml)
+data_mount: "/srv/data"
+
+# Caddy directories
+caddy_config_dir: "{{ data_mount }}/system/ingress/caddy/config"
+caddy_data_dir: "{{ data_mount }}/system/ingress/caddy/data"
+caddy_config_storage_dir: "{{ data_mount }}/system/ingress/caddy/storage"
+caddy_log_dir: "{{ data_mount }}/system/ingress/caddy/logs"
+
+# ACME email for Let's Encrypt
+caddy_admin_email: ""
+
+# Static files base path (read-only mount for serving static content)
+static_base_path: "{{ data_mount }}/static"
+
+# Resource limits for Caddy container
+caddy_memory_max: "512M"
+caddy_cpu_quota: "30%"
+caddy_cpu_weight: 2048

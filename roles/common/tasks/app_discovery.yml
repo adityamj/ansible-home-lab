@@ -1,0 +1,141 @@
+---
+- name: Build app root candidates
+  ansible.builtin.set_fact:
+    apps_root_candidates:
+      - "{{ playbook_dir }}"
+      - "{{ inventory_dir | dirname | dirname }}"
+      - "{{ role_path | dirname | dirname }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Find app directories
+  ansible.builtin.find:
+    paths: "{{ item }}/apps"
+    file_type: directory
+    depth: 1
+  loop: "{{ apps_root_candidates }}"
+  register: apps_find_results
+  delegate_to: localhost
+  become: false
+  run_once: true
+  failed_when: false
+
+- name: Collect app directory paths
+  ansible.builtin.set_fact:
+    apps_dirs: >-
+      {%- set match = (apps_find_results.results | selectattr('matched', '>', 0) | list | first) -%}
+      {{ match.files | map(attribute='path') | list if match is defined else [] }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Build apps list from app directories
+  ansible.builtin.set_fact:
+    apps_list: >-
+      {%- set items = [] -%}
+      {%- for app_dir in apps_dirs | default([]) -%}
+      {%-   set app_name = app_dir | basename -%}
+      {%-   set app_path = app_dir + '/app.yml' -%}
+      {%-   set app_data = lookup('ansible.builtin.file', app_path) | from_yaml -%}
+      {%-   set app_json = app_data | to_json -%}
+      {%-   set app_json = app_json | replace('{{ app_name }}', app_name) -%}
+      {%-   set app_json = app_json | replace('{{ data_mount }}', data_mount) -%}
+      {%-   set app_json = app_json | replace('{{ static_base_path }}', static_base_path) -%}
+      {%-   set app_data = app_json | from_json -%}
+      {%-   set app_final = app_data
+            | combine(
+                {
+                  'name': app_name
+                },
+                recursive=True
+              )
+        -%}
+      {%-   set _ = items.append(app_final) -%}
+      {%- endfor -%}
+      {{ items | sort(attribute='name') }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Resolve assigned apps for this host
+  ansible.builtin.set_fact:
+    assigned_apps: "{{ hostvars[inventory_hostname].assigned_apps | default([]) }}"
+
+- name: Validate assigned apps exist
+  ansible.builtin.assert:
+    that:
+      - assigned_apps | difference(apps_list | map(attribute='name') | list) | length == 0
+    fail_msg: "One or more assigned_apps are missing from app definitions."
+  when: assigned_apps | length > 0
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Select apps assigned to this host
+  ansible.builtin.set_fact:
+    host_apps: "{{ apps_list | selectattr('name', 'in', assigned_apps) | list }}"
+  when: assigned_apps | length > 0
+
+- name: Set empty app list when no assignments
+  ansible.builtin.set_fact:
+    host_apps: []
+  when: assigned_apps | length == 0
+
+- name: Ensure app names are unique
+  ansible.builtin.assert:
+    that:
+      - (apps_list | map(attribute='name') | list | length) == (apps_list | map(attribute='name') | unique | list | length)
+    fail_msg: "Duplicate app names detected across app definitions."
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Ensure domains are unique across apps
+  ansible.builtin.set_fact:
+    all_domains: >-
+      {%- set items = [] -%}
+      {%- for app in apps_list -%}
+      {%-   set app_domains = app.domains | default([]) -%}
+      {%-   if (app_domains | length) == 0 and app.ingress is defined and app.ingress.main_domain is defined -%}
+      {%-     set app_domains = [app.ingress.main_domain] -%}
+      {%-   endif -%}
+      {%-   set _ = items.extend(app_domains) -%}
+      {%- endfor -%}
+      {{ items }}
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Ensure domains are unique
+  ansible.builtin.assert:
+    that:
+      - all_domains | length == (all_domains | unique | length)
+    fail_msg: "Duplicate domain detected across app definitions."
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Collect ingress networks for host apps
+  ansible.builtin.set_fact:
+    host_ingress_networks: []
+  when: (host_apps | length) > 0
+
+- name: Build ingress networks list
+  ansible.builtin.set_fact:
+    host_ingress_networks: >-
+      {{
+        host_ingress_networks
+        + [ (item.pod | default({})).ingress_network | default(item.name + '-ingress-net') ]
+      }}
+  loop: "{{ host_apps }}"
+  loop_control:
+    loop_var: item
+  when:
+    - (host_apps | length) > 0
+    - (item.containers | default([]) | length) > 0
+
+- name: Normalize ingress networks list
+  ansible.builtin.set_fact:
+    host_ingress_networks: "{{ host_ingress_networks | unique | sort }}"
+  when: (host_apps | length) > 0

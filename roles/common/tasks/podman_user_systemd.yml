@@ -1,0 +1,28 @@
+---
+- name: Capture podman user UID
+  ansible.builtin.command: "id -u {{ podman_user }}"
+  register: podman_uid
+  changed_when: false
+
+- name: Capture podman user GID
+  ansible.builtin.command: "id -g {{ podman_user }}"
+  register: podman_gid
+  changed_when: false
+
+- name: Build podman user systemd environment
+  ansible.builtin.set_fact:
+    podman_user_systemd_env:
+      XDG_RUNTIME_DIR: "/run/user/{{ podman_uid.stdout }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ podman_uid.stdout }}/bus"
+
+- name: Check systemd user manager status
+  ansible.builtin.command: "systemctl is-active user@{{ podman_uid.stdout }}.service"
+  register: podman_user_manager_status
+  changed_when: false
+  failed_when: false
+
+- name: Start systemd user manager for podman user
+  ansible.builtin.systemd:
+    name: "user@{{ podman_uid.stdout }}.service"
+    state: started
+  when: podman_user_manager_status.stdout | trim != 'active'
