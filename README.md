@@ -1,22 +1,43 @@
-# Rootless Podman + Quadlet Ansible Repo
+# Rootless Podman + Quadlet Ansible Automation
 
-This repository deploys stateful applications to Debian hosts using rootless Podman, systemd user Quadlets, per-host Caddy ingress, and containerized Restic for backups/migrations. Caddy and Restic are only run as containers—no host packages are installed beyond Podman and basic tooling.
+This repository contains the reusable Ansible automation for deploying stateful applications to Debian hosts using rootless Podman, systemd user Quadlets, per-host Caddy ingress, and containerized Restic for backups and migrations. Caddy and Restic are only run as containers; no host packages are installed beyond Podman and basic tooling.
+
+`automation/` can be used in two ways:
+
+- as a standalone automation repo with its own `ansible.cfg`, inventory, and vars
+- as a Git submodule inside a control repo that keeps deployment-specific inventory, vars, secrets, and app definitions outside the reusable automation code
 
 ## Quick start
 
+From a parent control repo that vendors this project as `automation/`:
+
 ```bash
-ansible-galaxy collection install -r collections/requirements.yml
+ansible-galaxy collection install -r automation/collections/requirements.yml
 ansible-vault encrypt group_vars/all/vault.yml
+ansible-playbook automation/bootstrap.yml -e "apps_root=$(pwd)/apps"
 ```
 
-1. Populate `inventories/production/hosts.yml` with your hosts.
-2. Map apps per host in `host_vars/<host>.yml` via `assigned_apps`.
-3. Adjust `group_vars/all/main.yml` for usernames, paths, and images.
-4. Define apps in `apps/<app>/app.yml`.
-5. Set `apps_root` to the controller path that contains app folders (for example `/path/to/control-repo/apps`). If omitted, it defaults to `apps` for backward compatibility.
-6. Store secrets and overrides in `group_vars/all/vault.yml` and encrypt it.
-7. Bootstrap hosts and deploy: `ansible-playbook bootstrap.yml -e "apps_root=/path/to/control-repo/apps"`.
-8. Deploy apps: `ansible-playbook deploy.yml -e "apps_root=/path/to/control-repo/apps"`.
+1. Keep the active `ansible.cfg` in the directory where you run `ansible-playbook`.
+2. If you are using a parent control repo, set `roles_path = ./automation/roles` and `collections_paths = ./automation/collections:~/.ansible/collections:/usr/share/ansible/collections`.
+3. Populate `inventories/production/hosts.yml` with your hosts.
+4. Map apps per host in `host_vars/<host>.yml` via `assigned_apps`.
+5. Adjust `group_vars/all/main.yml` for usernames, paths, and images.
+6. Define apps in `apps/<app>/app.yml`.
+7. Set `apps_root` to the controller path that contains app folders. In a parent control repo this is typically `$(pwd)/apps`.
+8. Store secrets and overrides in `group_vars/all/vault.yml` and encrypt it.
+9. Bootstrap hosts and deploy: `ansible-playbook automation/bootstrap.yml -e "apps_root=$(pwd)/apps"`.
+10. Deploy apps: `ansible-playbook automation/deploy.yml -e "apps_root=$(pwd)/apps"`.
+
+If you use `automation/` standalone, run the same playbooks from inside this directory and keep your inventory and vars alongside it. A default reusable config lives at `automation/ansible.cfg`; parent repos can override it with their own top-level `ansible.cfg`.
+
+## Recommended config
+
+The default SSH posture is host key checking enabled with OpenSSH `accept-new`:
+
+- new hosts are accepted automatically on first connect
+- existing host key changes still fail closed
+
+That keeps first-time provisioning convenient without disabling host authenticity checks entirely.
 
 ## What gets installed
 
