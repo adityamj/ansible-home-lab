@@ -26,5 +26,30 @@ caddy_image: "docker.io/library/caddy:2-alpine"
 # Caddy container user (for ownership fix)
 caddy_container_user: "0:0"
 
+# Default ingress health/retry tuning for app backends.
+# These are only applied when a container declares a healthcheck block.
+app_healthcheck_defaults:
+  path: "/health"
+  interval: "2s"
+  timeout: "1s"
+  passes: 2
+  fails: 1
+  status: 200
+  retry_duration: "20s"
+  retry_interval: "500ms"
+  fail_duration: "30s"
+  max_fails: 1
+  unhealthy_status:
+    - "5xx"
+
+# Default runtime healthcheck settings for Quadlet containers.
+# Rendered only when a container defines runtime_healthcheck.
+app_runtime_healthcheck_defaults:
+  interval: "30s"
+  timeout: "10s"
+  retries: 3
+  start_period: "20s"
+  on_failure: "kill"
+
 # Optional: limit deployment to a single app
 # target_app: ""

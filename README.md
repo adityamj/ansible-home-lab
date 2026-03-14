@@ -73,6 +73,36 @@ That keeps first-time provisioning convenient without disabling host authenticit
     - `protocol`: optional, defaults to `tcp`
     - `host_ip`: optional bind address, defaults to all interfaces
   - Prefer unprivileged ports and keep the exposure app-specific and justified.
+- Optional per-container `healthcheck` documents the app-facing probe Caddy should use for ingress retry and upstream health decisions.
+  - This is ingress-side behavior only; it does not define the container runtime health state.
+  - Keep it aligned with the endpoint the app exposes on the ingress network.
+- Optional per-container `runtime_healthcheck` defines a Podman container healthcheck when the image and app warrant one.
+  - This is separate from Caddy health/retry and is optional by design.
+  - Use it only when the image has a meaningful probe command or endpoint; many images do not.
+  - Treat it as image-specific runtime behavior, not a universal requirement.
+
+Concise examples:
+
+```yaml
+containers:
+  - name: vikunja
+    image: vikunja/vikunja:latest
+    entrypoint: true
+    healthcheck:
+      path: /health
+    runtime_healthcheck:
+      command: ["/app/vikunja/vikunja", "doctor"]
+
+  - name: headscale
+    image: headscale/headscale:latest
+    entrypoint: true
+    healthcheck:
+      path: /health
+    runtime_healthcheck:
+      command: ["headscale", "health"]
+```
+
+For `headscale`, the ingress healthcheck is usually enough; add `runtime_healthcheck` only when the selected image exposes a reliable native probe you want Podman to enforce.
 
 ## Playbooks
 

@@ -9,7 +9,34 @@ Key fields per app:
 - `type`: `container` or `static`.
 - `pod.ingress_network` / `pod.internal_network`: ingress and internal network names.
 - `containers`: list of containers; mark one container with `entrypoint: true` for default proxying.
+- `containers[].healthcheck`: optional per-container ingress health config used by Caddy for upstream health and retry behavior.
+- `containers[].runtime_healthcheck`: optional per-container Podman healthcheck; keep it image-specific and only set it when the image has a valid runtime probe.
 - `static_paths`: optional static handlers for mixed apps. Files should be placed in `/srv/data/static/<app>/public`.
+
+`healthcheck` and `runtime_healthcheck` serve different layers:
+- `healthcheck` is ingress-side only. It tells Caddy what to probe on the app network and does not define container runtime state.
+- `runtime_healthcheck` is optional runtime behavior inside Podman. Use it only when the image supports a trustworthy probe command or localhost endpoint.
+
+Examples:
+
+```yaml
+containers:
+  - name: vikunja
+    entrypoint: true
+    healthcheck:
+      path: /health
+    runtime_healthcheck:
+      command: ["/app/vikunja/vikunja", "doctor"]
+
+  - name: headscale
+    entrypoint: true
+    healthcheck:
+      path: /health
+    runtime_healthcheck:
+      command: ["headscale", "health"]
+```
+
+In practice, `runtime_healthcheck` should stay explicit and image-specific; many images do not expose a native exec-form probe, so `healthcheck` remains the primary ingress safeguard.
 
 ## Migration flow
 

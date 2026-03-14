@@ -393,6 +393,111 @@
   ansible.builtin.set_fact:
     container_networks: "{{ container_networks | reject('equalto', '') | list }}"
 
+- name: Resolve healthcheck defaults for container
+  ansible.builtin.set_fact:
+    role_healthcheck_defaults: "{{ app_healthcheck_defaults | default({}) }}"
+    role_runtime_healthcheck_defaults: "{{ app_runtime_healthcheck_defaults | default({}) }}"
+
+- name: Validate healthcheck default types
+  ansible.builtin.assert:
+    that:
+      - role_healthcheck_defaults is mapping
+      - role_runtime_healthcheck_defaults is mapping
+    fail_msg: >-
+      healthcheck and runtime_healthcheck role defaults must be mappings when defined.
+
+- name: Validate healthcheck input types
+  ansible.builtin.assert:
+    that:
+      - container.healthcheck is not defined or container.healthcheck is mapping
+      - container.runtime_healthcheck is not defined or container.runtime_healthcheck is mapping
+    fail_msg: >-
+      container.healthcheck and container.runtime_healthcheck must be mappings when defined: {{ container }}
+
+- name: Build normalized healthcheck values for container
+  ansible.builtin.set_fact:
+    container_has_healthcheck: "{{ container.healthcheck is defined }}"
+    container_has_runtime_healthcheck: "{{ container.runtime_healthcheck is defined }}"
+    normalized_container_healthcheck: >-
+      {{
+        role_healthcheck_defaults
+        | combine(container.healthcheck | default({}, true), recursive=True)
+        | combine({'service_port': (container.service_port | default((container.ports[0] if (container.ports is defined and (container.ports | length > 0)) else 8080)))}, recursive=True)
+        if container.healthcheck is defined
+        else {}
+      }}
+    normalized_container_runtime_healthcheck: >-
+      {{
+        role_runtime_healthcheck_defaults
+        | combine(container.runtime_healthcheck | default({}, true), recursive=True)
+        if container.runtime_healthcheck is defined
+        else {}
+      }}
+
+- name: Validate normalized healthcheck
+  ansible.builtin.assert:
+    that:
+      - normalized_container_healthcheck is mapping
+      - normalized_container_healthcheck.path is defined
+      - (normalized_container_healthcheck.path | string | trim | length) > 0
+      - normalized_container_healthcheck.service_port is defined
+      - (normalized_container_healthcheck.service_port | int) > 0
+      - (normalized_container_healthcheck.service_port | int) < 65536
+    fail_msg: >-
+      container.healthcheck must resolve to a mapping with non-empty path and valid service_port: {{ container }}
+  when: container_has_healthcheck
+
+- name: Validate normalized runtime healthcheck
+  ansible.builtin.assert:
+    that:
+      - normalized_container_runtime_healthcheck is mapping
+      - normalized_container_runtime_healthcheck.command is defined
+      - >-
+        (
+          normalized_container_runtime_healthcheck.command is string
+          and (normalized_container_runtime_healthcheck.command | trim | length) > 0
+        )
+        or
+        (
+          normalized_container_runtime_healthcheck.command is sequence
+          and normalized_container_runtime_healthcheck.command is not string
+          and normalized_container_runtime_healthcheck.command is not mapping
+          and (normalized_container_runtime_healthcheck.command | length) > 0
+        )
+    fail_msg: >-
+      container.runtime_healthcheck must resolve to a mapping with a non-empty command: {{ container }}
+  when: container_has_runtime_healthcheck
+
+- name: Build normalized container config for templates
+  ansible.builtin.set_fact:
+    normalized_container: >-
+      {{
+        container
+        | combine(
+            {'env': merged_env},
+            recursive=True
+          )
+        | combine(
+            (
+              {
+                'healthcheck': normalized_container_healthcheck | combine(
+                  {'service_port': (normalized_container_healthcheck.service_port | int)},
+                  recursive=True
+                )
+              }
+            )
+            if container_has_healthcheck
+            else {},
+            recursive=True
+          )
+        | combine(
+            {'runtime_healthcheck': normalized_container_runtime_healthcheck}
+            if container_has_runtime_healthcheck
+            else {},
+            recursive=True
+          )
+      }}
+
 - name: Ensure container networks exist
   containers.podman.podman_network:
     name: "{{ item }}"
@@ -411,7 +516,7 @@
   become_user: "{{ podman_user }}"
   vars:
     app: "{{ app }}"
-    container: "{{ container | combine({'env': merged_env}) }}"
+    container: "{{ normalized_container }}"
     volumes: "{{ resolved_volumes | default([]) }}"
     mounts: "{{ resolved_mounts | default([]) }}"
     container_networks: "{{ container_networks }}"

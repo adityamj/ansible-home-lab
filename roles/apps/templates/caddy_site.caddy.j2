@@ -1,4 +1,48 @@
 # Caddy site config for {{ app.name }}
+{% macro reverse_proxy_block(container, target_port) -%}
+{% set hc = container.healthcheck if container.healthcheck is defined else none %}
+{% if hc is not none %}
+{% set hc_defaults = app_healthcheck_defaults | default({}) %}
+{% set hc = hc_defaults | combine(hc, recursive=True) %}
+        reverse_proxy {{ app.name }}-{{ container.name }}:{{ target_port }} {
+{% if hc.retry_duration is defined %}
+            lb_try_duration {{ hc.retry_duration }}
+{% endif %}
+{% if hc.retry_interval is defined %}
+            lb_try_interval {{ hc.retry_interval }}
+{% endif %}
+{% if hc.path is defined %}
+            health_uri {{ hc.path }}
+{% endif %}
+{% if hc.interval is defined %}
+            health_interval {{ hc.interval }}
+{% endif %}
+{% if hc.timeout is defined %}
+            health_timeout {{ hc.timeout }}
+{% endif %}
+{% if hc.passes is defined %}
+            health_passes {{ hc.passes }}
+{% endif %}
+{% if hc.fails is defined %}
+            health_fails {{ hc.fails }}
+{% endif %}
+{% if hc.status is defined %}
+            health_status {{ hc.status }}
+{% endif %}
+{% if hc.fail_duration is defined %}
+            fail_duration {{ hc.fail_duration }}
+{% endif %}
+{% if hc.max_fails is defined %}
+            max_fails {{ hc.max_fails }}
+{% endif %}
+{% if hc.unhealthy_status is defined %}
+            unhealthy_status {{ hc.unhealthy_status | join(' ') if (hc.unhealthy_status is sequence and hc.unhealthy_status is not string) else hc.unhealthy_status }}
+{% endif %}
+        }
+{% else %}
+        reverse_proxy {{ app.name }}-{{ container.name }}:{{ target_port }}
+{% endif %}
+{%- endmacro %}
 {% set app_type = app.type | default('container') %}
 {% set domains = app.domains | default([]) %}
 {% if domains | length == 0 and app.ingress is defined and app.ingress.main_domain is defined %}
@@ -63,11 +107,11 @@
 {% set target_port = c.service_port | default((c.ports[0] if (c.ports is defined and (c.ports | length > 0)) else 8080)) %}
 {% if route.strip_prefix | default(true) %}
     handle_path {{ route.path }} {
-        reverse_proxy {{ app.name }}-{{ c.name }}:{{ target_port }}
+{{ reverse_proxy_block(c, target_port) }}
     }
 {% else %}
     handle {{ route.path }} {
-        reverse_proxy {{ app.name }}-{{ c.name }}:{{ target_port }}
+{{ reverse_proxy_block(c, target_port) }}
     }
 {% endif %}
 {% endfor %}
@@ -76,7 +120,7 @@
 {% if entry is not none %}
 {% set entry_port = entry.service_port | default((entry.ports[0] if (entry.ports is defined and (entry.ports | length > 0)) else 8080)) %}
     handle {
-        reverse_proxy {{ app.name }}-{{ entry.name }}:{{ entry_port }}
+{{ reverse_proxy_block(entry, entry_port) }}
     }
 {% else %}
     respond "No entrypoint container configured for this domain." 502

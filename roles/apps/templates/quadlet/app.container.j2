@@ -14,6 +14,26 @@ User={{ container.user }}
 {% if container.command is defined %}
 Exec={{ container.command if container.command is string else container.command | join(' ') }}
 {% endif %}
+{% if container.runtime_healthcheck is defined %}
+{% set runtime_healthcheck_defaults = app_runtime_healthcheck_defaults | default({}) %}
+{% set runtime_healthcheck = runtime_healthcheck_defaults | combine(container.runtime_healthcheck, recursive=True) %}
+HealthCmd={{ runtime_healthcheck.command if runtime_healthcheck.command is string else runtime_healthcheck.command | to_json }}
+{% if runtime_healthcheck.interval is defined %}
+HealthInterval={{ runtime_healthcheck.interval }}
+{% endif %}
+{% if runtime_healthcheck.timeout is defined %}
+HealthTimeout={{ runtime_healthcheck.timeout }}
+{% endif %}
+{% if runtime_healthcheck.retries is defined %}
+HealthRetries={{ runtime_healthcheck.retries }}
+{% endif %}
+{% if runtime_healthcheck.start_period is defined %}
+HealthStartPeriod={{ runtime_healthcheck.start_period }}
+{% endif %}
+{% if runtime_healthcheck.on_failure is defined %}
+HealthOnFailure={{ runtime_healthcheck.on_failure }}
+{% endif %}
+{% endif %}
 {% for net in container_networks | default([]) %}
 Network={{ net }}
 {% endfor %}
