@@ -49,7 +49,8 @@
 {% set domains = [app.ingress.main_domain] %}
 {% endif %}
 {% set tls_mode = caddy_tls_override if (caddy_tls_override is defined) else (app.ingress.tls if (app.ingress is defined and app.ingress.tls is defined) else (caddy_tls_default | default(true))) %}
-{% set entry = (app.containers | default([]) | selectattr('entrypoint', 'defined') | selectattr('entrypoint') | list | first) %}
+{% set entry_candidates = (app.containers | default([]) | selectattr('entrypoint', 'defined') | selectattr('entrypoint') | list) %}
+{% set entry = (entry_candidates[0] if (entry_candidates | length) > 0 else none) %}
 {% set routed = (app.containers | default([]) | selectattr('proxy_paths', 'defined') | list) %}
 {% set static_paths = app.static_paths | default([]) %}
 {% set static_root_base = static_base_path | default('/srv/data/static') %}
@@ -100,7 +101,9 @@
 {% endif %}
 {% endfor %}
 {% if app_type == 'static' %}
+{% if not (app.ingress.disable_default_file_server | default(false)) %}
     file_server
+{% endif %}
 {% else %}
 {% for c in routed %}
 {% for route in c.proxy_paths %}

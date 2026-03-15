@@ -57,6 +57,7 @@ That keeps first-time provisioning convenient without disabling host authenticit
 - Volumes are defined by name plus `container_path`; the host path is derived automatically as `<app_data_base_path>/<app>/<volume name>` unless overridden.
 - Each app gets an ingress network (`<app>-ingress-net`) and optional internal network (`<app>-internal-net`) via `pod.ingress_network`/`pod.internal_network`.
 - Static-only apps use `type: static`; static files live under `/srv/data/static/<app>/public`.
+- Static apps add a default Caddy `file_server` after `ingress.caddy_directives`; set `ingress.disable_default_file_server: true` when your custom directives already handle redirects, routing, or file serving.
 - Mixed apps can define `static_paths` to serve filesystem paths from `/srv/data/static/<app>/public` alongside proxies.
 - Secret env overrides come from `vault_app_env_overrides` in the vaulted vars file.
 - Optional per-container `mounts` can stage files or directories under the app’s data path and mount them read-only into the container. Each mount needs `relative_path` (under the app base), `container_path`, and either `content` or `src`. Multiple mounts are supported.
@@ -103,6 +104,26 @@ containers:
 ```
 
 For `headscale`, the ingress healthcheck is usually enough; add `runtime_healthcheck` only when the selected image exposes a reliable native probe you want Podman to enforce.
+
+Static app example with custom Caddy handling:
+
+```yaml
+type: static
+
+ingress:
+  main_domain: docs.adityaj.in
+  tls: true
+  disable_default_file_server: true
+  caddy_directives: |
+    handle / {
+      redir * /guide/ 308
+    }
+
+    handle {
+      root * /srv/data/static/docs/public
+      file_server
+    }
+```
 
 ## Playbooks
 
