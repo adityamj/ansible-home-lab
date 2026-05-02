@@ -51,5 +51,9 @@ app_runtime_healthcheck_defaults:
   start_period: "20s"
   on_failure: "kill"
 
+# Default systemd restart behavior for app Quadlet services.
+app_restart_policy: "on-failure"
+app_restart_sec: "5s"
+
 # Optional: limit deployment to a single app
 # target_app: ""

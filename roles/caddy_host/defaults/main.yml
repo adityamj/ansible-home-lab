@@ -34,3 +34,7 @@ apps_root: "apps"
 caddy_memory_max: "512M"
 caddy_cpu_quota: "30%"
 caddy_cpu_weight: 2048
+
+# Default systemd restart behavior for the Caddy Quadlet service.
+caddy_restart_policy: "on-failure"
+caddy_restart_sec: "5s"

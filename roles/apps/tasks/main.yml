@@ -54,15 +54,24 @@
     - target_app | trim | length > 0
   run_once: true
 
-- name: Filter to target app on this host when provided
+- name: Determine apps to deploy on this host
   ansible.builtin.set_fact:
-    host_apps: "{{ host_apps | selectattr('name', 'equalto', target_app) | list }}"
+    deploy_apps: >-
+      {{
+        (host_apps | selectattr('name', 'equalto', target_app) | list)
+        if (target_app | default('') | string | trim | length > 0)
+        else host_apps
+      }}
   when:
-    - target_app | default('') | string | trim | length > 0
+    - host_apps is defined
+
+- name: Keep host app inventory intact for shared Caddy state
+  ansible.builtin.set_fact:
+    deploy_apps: "{{ deploy_apps | default(host_apps) }}"
 
 - name: Filter apps with containers
   ansible.builtin.set_fact:
-    host_container_apps: "{{ host_apps | selectattr('containers', 'defined') | selectattr('containers', 'ne', []) | list }}"
+    host_container_apps: "{{ deploy_apps | selectattr('containers', 'defined') | selectattr('containers', 'ne', []) | list }}"
 
 - name: Initialize change trackers
   ansible.builtin.set_fact:
@@ -76,10 +85,10 @@
 
 - name: Deploy app
   ansible.builtin.include_tasks: deploy_app.yml
-  loop: "{{ host_apps }}"
+  loop: "{{ deploy_apps }}"
   loop_control:
     loop_var: app
-  when: (host_apps | length) > 0
+  when: (deploy_apps | length) > 0
 
 - name: Reload systemd user daemon for podman user
   ansible.builtin.systemd:
@@ -90,7 +99,7 @@
   environment: "{{ podman_user_systemd_env }}"
   changed_when: false
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - quadlet_units_changed | default(false)
 
 - name: Check if Caddy container is running
@@ -102,7 +111,7 @@
   register: caddy_info
   changed_when: false
   failed_when: false
-  when: (host_apps | length) > 0
+  when: (deploy_apps | length) > 0
 
 - name: Collect Caddy attached networks
   ansible.builtin.set_fact:
@@ -115,7 +124,7 @@
         | list
       }}
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - (host_ingress_networks | length) > 0
     - (caddy_info.containers | default([])) | length > 0
 
@@ -138,7 +147,7 @@
   register: caddy_attach_results
   loop: "{{ caddy_missing_networks | default([]) }}"
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - (caddy_missing_networks | default([]) | length) > 0
     - (caddy_info.containers | default([])) | length > 0
 
@@ -163,7 +172,7 @@
         (caddy_config_changed or caddy_network_changes)
         and not (caddy_service_restart_needed | default(false))
       }}
-  when: (host_apps | length) > 0
+  when: (deploy_apps | length) > 0
 
 - name: Validate Caddy configuration
   ansible.builtin.command: >-
@@ -176,7 +185,7 @@
   environment: "{{ podman_user_systemd_env }}"
   changed_when: false
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - caddy_config_changed | default(false)
 
 - name: Reload Caddy after app updates
@@ -188,7 +197,7 @@
   become_user: "{{ podman_user }}"
   environment: "{{ podman_user_systemd_env }}"
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - caddy_reload_needed | default(false)
     - (caddy_info.containers | default([])) | length > 0
 
@@ -224,6 +233,6 @@
   become_user: "{{ podman_user }}"
   environment: "{{ podman_user_systemd_env }}"
   when:
-    - (host_apps | length) > 0
+    - (deploy_apps | length) > 0
     - caddy_service_restart_needed | default(false)
     - (caddy_info.containers | default([])) | length > 0

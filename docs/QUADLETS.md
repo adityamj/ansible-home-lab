@@ -5,6 +5,7 @@ Quadlets let systemd own the lifecycle of Podman containers using simple `.conta
 - Every long-running container (apps and per-host Caddy) is defined as a Quadlet.
 - Quadlets are rendered from Jinja templates and dropped into the podman user's systemd directory.
 - systemd user units are enabled/started with `systemctl --user` (invoked via `runuser -l {{ podman_user }}`).
+- Quadlet services default to `Restart=on-failure` and `RestartSec=5s` so crashed containers, killed healthcheck failures, and failed Caddy processes are restarted by systemd. App containers can override this with `restart_policy` and `restart_sec` in `app.yml`.
 - `AutoUpdate=registry` is set on each Quadlet so `podman-auto-update.timer` can refresh images periodically.
 - Networks, volumes, and environment variables are declared in the Quadlet `[Container]` section. Each app gets its own ingress network (`<app>-ingress-net`) and optional internal network (`<app>-internal-net`); Caddy joins only ingress networks on its host so it can proxy without exposing apps to each other.
 

@@ -81,6 +81,7 @@ That keeps first-time provisioning convenient without disabling host authenticit
   - This is separate from Caddy health/retry and is optional by design.
   - Use it only when the image has a meaningful probe command or endpoint; many images do not.
   - Treat it as image-specific runtime behavior, not a universal requirement.
+- App Quadlet services default to `Restart=on-failure` and `RestartSec=5s`; override per container with `restart_policy` and `restart_sec` only when an app needs different systemd restart behavior.
 
 Concise examples:
 

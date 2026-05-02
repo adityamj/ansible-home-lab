@@ -25,6 +25,8 @@ AutoUpdate=registry
 
 [Service]
 Delegate=yes
+Restart={{ caddy_restart_policy | default('on-failure') }}
+RestartSec={{ caddy_restart_sec | default('5s') }}
 ExecReload=/usr/bin/podman exec caddy caddy reload --config /etc/caddy/Caddyfile
 CPUWeight={{ caddy_cpu_weight | default(2048) }}
 CPUQuota={{ caddy_cpu_quota | default('30%') }}

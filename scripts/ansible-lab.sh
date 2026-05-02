@@ -13,6 +13,7 @@ DISK_IMG="${BASE_DIR}/${VM_NAME}.qcow2"
 
 USER_DATA="${BASE_DIR}/user-data"
 META_DATA="${BASE_DIR}/meta-data"
+NETWORK_CONFIG="${BASE_DIR}/network-config"
 
 OS_VARIANT="debian13"
 NET_NAME="default"
@@ -120,6 +121,36 @@ EOF
 instance-id: ${VM_NAME}
 local-hostname: ${VM_NAME}
 EOF
+
+  # network-config
+  cat >"${NETWORK_CONFIG}" <<EOF
+version: 2
+renderer: networkd
+ethernets:
+  uplink0:
+    match:
+      macaddress: "${MAC_ADDR}"
+    set-name: uplink0
+    dhcp4: false
+    dhcp6: false
+bridges:
+  br0:
+    interfaces: [uplink0]
+    addresses:
+      - 192.168.122.50/24
+    routes:
+      - to: default
+        via: 192.168.122.1
+    nameservers:
+      addresses:
+        - 1.1.1.1
+        - 9.9.9.9
+    parameters:
+      stp: false
+      forward-delay: 0
+    dhcp4: false
+    dhcp6: false
+EOF
 }
 
 ### =========================
@@ -155,7 +186,7 @@ create() {
     --network network="${NET_NAME}",model=virtio,mac="${MAC_ADDR}" \
     --graphics none \
     --noautoconsole \
-    --cloud-init "user-data=${USER_DATA},meta-data=${META_DATA}"
+    --cloud-init "user-data=${USER_DATA},meta-data=${META_DATA},network-config=${NETWORK_CONFIG}"
 }
 
 up() {
@@ -190,7 +221,7 @@ delete() {
     virsh -c qemu:///system undefine "${VM_NAME}" --nvram
   fi
 
-  rm -f "${DISK_IMG}" "${USER_DATA}" "${META_DATA}"
+  rm -f "${DISK_IMG}" "${USER_DATA}" "${META_DATA}" "${NETWORK_CONFIG}"
 }
 
 reset() {

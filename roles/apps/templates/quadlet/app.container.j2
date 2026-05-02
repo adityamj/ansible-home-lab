@@ -72,6 +72,8 @@ Tmpfs=/run:size=32m
 AutoUpdate=registry
 
 [Service]
+Restart={{ container.restart_policy | default(app_restart_policy | default('on-failure')) }}
+RestartSec={{ container.restart_sec | default(app_restart_sec | default('5s')) }}
 CPUWeight={{ container.cpu_shares | default(1024) }}
 CPUQuota={{ container.cpu_quota | default('10%') }}
 
