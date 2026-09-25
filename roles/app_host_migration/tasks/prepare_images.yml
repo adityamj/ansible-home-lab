@@ -1,0 +1,47 @@
+---
+- name: Pull immutable source image digests on target
+  containers.podman.podman_image:
+    name: "{{ item.value }}"
+    state: present
+  loop: "{{ migration_resolved_images | dict2items }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  loop_control:
+    label: "{{ item.value }}"
+
+- name: Point each unchanged Quadlet image tag at the verified digest
+  ansible.builtin.command:
+    argv: [podman, image, tag, "{{ item.value }}", "{{ item.key }}"]
+  loop: "{{ migration_resolved_images | dict2items }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.key is not search('@sha256:')
+
+- name: Inspect digest and local tag identities
+  ansible.builtin.command:
+    argv: [podman, image, inspect, "{{ item.value }}", "{{ item.key }}"]
+  loop: "{{ migration_resolved_images | dict2items }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_target_images
+  changed_when: false
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Require unchanged tag and immutable digest to identify the same target image
+  ansible.builtin.assert:
+    that:
+      - item.stdout | from_json | map(attribute='Id') | unique | length == 1
+  loop: "{{ migration_target_images.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+- name: Publish prepared tags so ordinary staging cannot resolve them again
+  ansible.builtin.set_fact:
+    app_prepared_image_digests: "{{ migration_resolved_images }}"

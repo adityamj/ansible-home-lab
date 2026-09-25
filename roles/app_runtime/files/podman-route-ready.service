@@ -1,0 +1,7 @@
+[Unit]
+Description=Wait for a usable host IPv4 route before rootless Podman
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/podman-wait-route
+RemainAfterExit=yes

@@ -1,0 +1,249 @@
+---
+- name: Require a real host-wide migration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - target_app | default('') | string | trim | length == 0
+      - app | default('') | string | trim | length == 0
+      - not ansible_check_mode
+    fail_msg: "Use --limit to select hosts. Targeted migration and check mode are unsupported."
+
+- name: Validate storage settings
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/validate_storage.yml"
+
+- name: Load rootless account facts without starting its manager
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_facts.yml"
+
+- name: Verify persistent storage
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Compile migration catalog
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ app_model_compiler_path }}"
+      - --apps-root
+      - "{{ apps_root }}"
+    stdin: "{{ {'assigned_apps': assigned_apps | default([]), 'app_desired_states': app_desired_states | default({}), 'ssh_port': ssh_port} | to_json }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: migration_compilation
+
+- name: Decode migration catalog
+  ansible.builtin.set_fact:
+    migration_plan: "{{ migration_compilation.stdout | from_json }}"
+
+- name: Collect legacy resources and existing volume roots
+  ansible.builtin.set_fact:
+    migration_legacy_names: >-
+      {%- set names = [] -%}
+      {%- for application in migration_plan.host_apps -%}
+      {%- for container in application.containers -%}
+      {%- set _ = names.append(application.name ~ '-' ~ container.name) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ names }}
+    migration_volume_paths: >-
+      {%- set paths = [] -%}
+      {%- for application in migration_plan.host_apps -%}
+      {%- for container in application.containers -%}
+      {%- for volume in container.volumes | default([]) -%}
+      {%- set _ = paths.append(data_mount ~ '/apps/' ~ application.name ~ '/volumes/' ~ volume.name) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ paths | unique | list }}
+    migration_legacy_networks: >-
+      {{ migration_plan.host_apps | selectattr('containers') | map(attribute='name')
+         | map('regex_replace', '$', '-ingress-net') | list }}
+
+- name: Collect administrator-owned legacy activation sources
+  ansible.builtin.set_fact:
+    migration_legacy_container_sources: >-
+      {{ migration_legacy_names | map('regex_replace', '^', podman_quadlet_dir ~ '/')
+         | map('regex_replace', '$', '.container') | list }}
+    # Quadlet filenames and runtime NetworkName values are distinct contracts:
+    # <app>-ingress.network creates <app>-ingress-net.
+    migration_legacy_network_sources: >-
+      {{ migration_legacy_networks | map('regex_replace', '^', podman_quadlet_dir ~ '/')
+         | map('regex_replace', '-net$', '.network') | list }}
+
+- name: Reject ambiguous resource ownership
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - migration_legacy_names | unique | length == migration_legacy_names | length
+      - migration_legacy_names | intersect(migration_plan.host_container_resource_names) | length == 0
+      - migration_legacy_networks | intersect(migration_plan.host_network_resource_names) | length == 0
+
+- name: Require canonical existing volume directories
+  ansible.builtin.command:
+    argv: [realpath, -e, "{{ item }}"]
+  loop: "{{ migration_volume_paths }}"
+  register: migration_volume_canonical
+  changed_when: false
+  failed_when: migration_volume_canonical.rc != 0 or migration_volume_canonical.stdout != item
+
+- name: Inspect existing volume roots
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop: "{{ migration_volume_paths }}"
+  register: migration_volume_stats
+
+- name: Require existing volume directories
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stat.isdir | default(false)
+      - not item.stat.islnk | default(false)
+  loop: "{{ migration_volume_stats.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Require running ingress before interrupting applications
+  containers.podman.podman_container_info:
+    name: caddy
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_caddy
+
+- name: Check ingress precondition
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - migration_caddy.containers | length == 1
+      - migration_caddy.containers[0].State.Running | default(false)
+
+# Persistent masks are installed BEFORE any stable Quadlets. A reboot at any
+# subsequent point cannot reactivate a legacy writer. Leave masks in place.
+- name: Reject symlinked user configuration ancestors
+  ansible.builtin.command:
+    argv: [realpath, -m, "{{ item }}"]
+  loop:
+    - "{{ podman_home }}/.config/systemd/user"
+    - "{{ podman_home }}/.config/containers/systemd"
+    - "{{ podman_quadlet_dir }}"
+  register: migration_config_path
+  changed_when: false
+  failed_when: migration_config_path.rc != 0 or migration_config_path.stdout != item
+
+- name: Validate discovered writers and effective Caddy baseline before cutover
+  ansible.builtin.include_tasks: validate_name_migration.yml
+
+- name: Ensure user unit directory exists
+  ansible.builtin.file:
+    path: "{{ podman_home }}/.config/systemd/user"
+    state: directory
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: '0755'
+
+- name: Persistently mask legacy container services
+  ansible.builtin.file:
+    src: /dev/null
+    dest: "{{ podman_home }}/.config/systemd/user/{{ item }}.service"
+    state: link
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    force: false
+  loop: "{{ migration_legacy_names }}"
+
+- name: Reverify storage before activating the masked user manager
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Prepare rootless manager after activation is blocked
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_systemd.yml"
+
+- name: Load persistent masks
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+- name: Build legacy cleanup records
+  ansible.builtin.set_fact:
+    legacy_container_name_migrations: >-
+      {%- set records = [] -%}
+      {%- for name in migration_legacy_names -%}
+      {%- set _ = records.append({'legacy_container': name, 'legacy_service': name ~ '.service'}) -%}
+      {%- endfor -%}
+      {{ records }}
+
+- name: Stop legacy writers and remove old container sources
+  ansible.builtin.include_tasks: migrate_legacy_container_names.yml
+
+# Reuse the steady-state executor rather than maintaining a second deployer.
+# Do not replace its previous manifest: it needs that state for normal GC.
+- name: Apply stable deployment
+  ansible.builtin.include_tasks: main.yml
+
+- name: Require stable Caddy references before retiring legacy networks
+  ansible.builtin.include_tasks: validate_caddy_migration_dropins.yml
+  vars:
+    migration_allow_legacy_caddy_networks: false
+
+- name: Remove obsolete default network Quadlets
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ migration_legacy_network_sources }}"
+
+- name: Reload after legacy network source removal
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+# Observe rather than match version-dependent error messages. Static apps never
+# had ingress networks; interrupted cleanup may already have detached/deleted
+# some networks. Unexpected failures after observation still stop migration.
+- name: Inventory existing Podman network names before cleanup
+  ansible.builtin.command:
+    argv: [podman, network, ls, --format, "{{ '{{.Name}}' }}"]
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_network_inventory
+  changed_when: false
+
+- name: Inspect current Caddy network attachments before cleanup
+  containers.podman.podman_container_info:
+    name: caddy
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_cleanup_caddy
+
+- name: Require running Caddy before legacy network cleanup
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - migration_cleanup_caddy.containers | length == 1
+      - migration_cleanup_caddy.containers[0].State.Running | default(false)
+
+- name: Select existing legacy networks and attached legacy networks
+  ansible.builtin.set_fact:
+    migration_networks_to_remove: >-
+      {{ migration_legacy_networks | intersect(migration_network_inventory.stdout_lines) | sort }}
+    migration_networks_to_disconnect: >-
+      {{ migration_legacy_networks | intersect(migration_network_inventory.stdout_lines)
+         | intersect((migration_cleanup_caddy.containers[0].NetworkSettings.Networks | default({}, true)).keys() | list)
+         | sort }}
+
+- name: Disconnect attached old ingress networks after stable deployment succeeds
+  ansible.builtin.command:
+    argv: [podman, network, disconnect, "{{ item }}", caddy]
+  loop: "{{ migration_networks_to_disconnect }}"
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+
+- name: Remove existing unused legacy networks without force
+  ansible.builtin.command:
+    argv: [podman, network, rm, "{{ item }}"]
+  loop: "{{ migration_networks_to_remove }}"
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true

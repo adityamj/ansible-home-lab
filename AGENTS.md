@@ -1,269 +1,111 @@
-# AGENTS.md
+# Contributor Architecture Rules
 
-This file is the **single source of truth** for AI coding agents (Cursor, Aider, Claude Code, GitHub Copilot agents, etc.) working on this repository.
+This repository provides reusable, rootless application hosting automation for
+Debian systems.
 
-It defines the **final architectural spec**, conventions, safety boundaries, and concrete examples so agents can contribute accurately without hallucinating incompatible patterns.
+## Invariants
 
-**Project mission**  
-Build and maintain a **frugal enterprise-grade**, multi-host, fully rootless service management platform using:
+- Use Ansible for all host and runtime changes.
+- Use rootless Podman and systemd Quadlets for every long-running container.
+- Run one rootless Caddy ingress container per application host.
+- Keep all persistent data beneath `data_mount`.
+- Require an explicit `storage_mode`: `mount` requires a real mountpoint, `zfs`
+  requires the exact managed dataset hierarchy, and `plain` is for labs/tests.
+- Give every app only compiler-named app-owned networks using escaped logical
+  components and explicit resource-kind tags.
+- Allow Caddy to join only aliases explicitly marked `caddy: true`.
+- Never join Caddy to an internal network.
+- Never restart Caddy during routine deployment; validate and reload it.
+- Never publish app ports unless the protocol cannot use Caddy and the app
+  declares the exception explicitly.
+- Treat each published protocol/host-port pair as a unique host resource and
+  derive its nftables allowance from the app declaration.
+- Own the complete host nftables ruleset exclusively. Replace it atomically,
+  detect whole-ruleset drift, and reject independent iptables-legacy policy.
+  Other host firewall writers and foreign NAT/VPN tables are unsupported.
+- Never delete persistent app or static data during normal reconciliation.
+- Treat writable app volumes as PVC-like storage: create a missing declared
+  root, but never reconcile ownership, mode, or contents of an existing volume.
+- Treat managed read-only mounts as ConfigMap-like content owned and enforced by
+  this automation.
+- Never use Docker, Compose, Kubernetes, privileged containers, or rootful
+  Podman.
 
-- **Ansible** for orchestration, declarative configuration, lifecycle, and migration
-- **Podman** (rootless only) + **Quadlets** (systemd-native units) for all containers
-- Single **Caddy** instance per host (rootless Quadlet container) as reverse proxy / ingress
-- Per-app declarative YAML configs (`apps/*/app.yml`) acting as simplified compose → quadlet translator
-- Unified persistent storage under `/srv/data` (EBS-like mount, survives host failure)
+## Supported Interfaces
 
-No Docker, no docker-compose, no privileged containers, no Kubernetes.  
-Treat as long-term production infrastructure: idempotent, auditable, recoverable, minimal blast radius, 10+ year durability.
+`bootstrap.yml` prepares a host and its Caddy/firewall platform baseline.
+`update_platform.yml` explicitly reapplies that shared baseline implementation.
+`deploy.yml` supports authoritative full app reconciliation and targeted
+`-e app=<app>` reconciliation. It checks platform prerequisites rather than
+reconciling Caddy's base container or firewall service/package wiring. Legacy
+compatibility operations belong exclusively in migration-specific files.
 
-**Core architectural invariants (do NOT break without explicit discussion):**
+Full deployment owns host-wide cleanup of resources recorded in managed app
+state. Targeted deployment owns only the selected app and must leave unrelated
+resources untouched.
 
-- One FQDN → one app (clean DNS, certificates, routing)
-- Per-app isolated ingress network: `<app>-ingress-net` — Caddy dynamically joins **only** this network for the app
-- Optional per-app internal network: `<app>-internal-net` — backend-only (DB, cache, workers); Caddy **never** joins
-- Path-based routing within an app: multiple containers share the ingress network and FQDN, differentiated by Caddy `handle` blocks
-- Static sites: served directly by Caddy (`file_server`) under the same FQDN — no container needed
-- All persistent data (app files, volumes, Caddy certs/config) under `/srv/data`
-- Caddy: graceful reload only — never restart
-- Operations: start/stop/restart/destroy/migrate with confirmation on destructive actions
+`force_refresh` defaults to false: unchanged configuration is trusted. When true,
+restart all selected app services, gracefully reload Caddy and user systemd, and
+reapply firewall policy on full runs. The resource ownership ledger must not
+implicitly force refresh. Do not reintroduce pending deployment transactions.
+Keep GC ownership and volume-initialization safeguards independent
+of this caller preference.
 
-## Repository Structure – Key Paths
+Physical app resource names encode `-` as `--` inside each logical component
+and join components with single `-` separators and a resource-kind tag. A
+targeted deployment requires the assigned-app set and naming version committed
+by the last successful full deployment; assignment changes require a full run.
 
-- `inventories/production/hosts.yml`          ← [homelab_servers], [caddy_hosts]
-- `host_vars/<host>.yml`                      ← assigned_apps: [], caddy_tuning: {}
-- `apps/<app-name>/app.yml`                   ← heart of the system
-- `apps/<app-name>/files/`                    ← configs copied → bind-mounted
-- `apps/<app-name>/secrets/`                  ← gitignored
-- `playbooks/`
-  - `system_prepare.yml`                      ← Podman, /srv/data mount, Caddy setup
-  - `app_manage.yml`                          ← start/stop/restart/destroy
-  - `app_migrate.yml`                         ← rsync-based migration
-  - `caddy_manage.yml`                        ← Caddy reload & global config
-- `roles/`
-  - `podman_system/`                          ← subuid, lingering, /srv/data mount
-  - `caddy_system_service/`                   ← rootless Caddy Quadlet + hardening
-  - `podman_app_deploy/`                      ← app.yml → Quadlets + networks + Caddy attach
+App definitions live at `apps/<app>/app.yml`. The directory name is the app
+name. Use canonical `domains`, logical `networks`, and logical volume names.
+Do not add configurable app roots, volume host paths, mount host paths, or
+physical network names.
 
-## Core Rules & Conventions
+The controller-side compiler in `tools/app_model` owns app schema validation,
+normalization, dependency resolution, derived resource names, and declaration
+collision checks. Ansible invokes it per host and remains the sole remote-state
+observer and actuator. Compiled plans must be deterministic, versioned, and
+free of secret values.
 
-### 1. Rootless & Security First
-- Rootless Podman everywhere — no exceptions.
-- Quadlet hardening for **all** containers (including Caddy):
-  ```
-  CapDrop=ALL
-  CapAdd=NET_BIND_SERVICE
-  NoNewPrivileges=true
-  ReadOnly=true
-  Tmpfs=/tmp:size=64m
-  Tmpfs=/run:size=32m
-  Memory=512M              # adjust per service
-  CPUWeight=1024          # cgroups v2 weight
-  CPUQuota=10%            # hard limit (optional)
-  ```
-- Use `:Z,U` on bind mounts for auto-chown to container runtime UID.
-- Pre-copy ownership fix (prevents flip-flop):
-  ```yaml
-  - name: Pre-set ownership in user namespace
-    become_user: "{{ podman_user }}"
-    command: >-
-      podman unshare chown -R $(id -u):$(id -g)
-      {{ app_root }}/files
-      {{ app_root }}/public
-    changed_when: false
-  ```
-- Use `synchronize` (rsync) for config dirs instead of `copy`/`template` when possible — preserves ownership/timestamps.
+Static content lives under `<static_base_path>/<app>` and is populated outside
+this automation. Creating required empty directories is allowed; copying or
+deleting static content is not. Declared static roots must remain writable by
+root and `podman` and readable by Caddy; descendant permissions are the
+publisher's responsibility.
 
-### 2. Networking & Isolation
-- No shared internal network — **per-app isolation only**.
-- Every app: `<app>-ingress-net` (Caddy + frontend/UI containers)
-- Optional: `<app>-internal-net` (backends only)
-- Dynamic Caddy attach:
-  ```yaml
-  - name: Attach Caddy to app ingress network
-    command: podman network connect {{ pod.ingress_network }} caddy
-    register: attach
-    changed_when: "'already connected' not in attach.stderr"
-    notify: Reload Caddy
-  ```
-- Disconnect on destroy/stop/migration source.
+Secrets come from encrypted variables and become app-namespaced Podman secrets.
+Do not place secret values in environment lines, generated Quadlets, task names,
+or logs.
 
-### 3. App Definition – Examples
+## Quadlet Defaults
 
-**Multi-container app example** (wiki with frontend + admin + db)
+Containers drop all capabilities, enable no-new-privileges, use a read-only root
+filesystem, receive bounded tmpfs mounts, and have memory and PID limits. Add a
+capability only when a service requires it. Hard CPU quota is opt-in.
 
-```yaml
-app_name: wiki
-host: blr1.adityaj.in
-app_root: "{{ data_mount }}/apps/wiki"
+Do not use registry auto-update. Image changes must be explicit deployment
+changes.
 
-type: container
+App networks are `.network` Quadlets. Caddy network persistence uses app-owned
+drop-ins under `caddy.container.d/`; live attachment uses checked Podman network
+commands without Caddy restart.
 
-pod:
-  name: wiki
-  ingress_network: wiki-ingress-net
-  internal_network: wiki-internal-net
+## Ansible Style
 
-ingress:
-  main_domain: wiki.adityaj.in
-  tls: true
+- Use fully qualified collection names.
+- Prefer idempotent modules and explicit `changed_when` for commands.
+- Run rootless Podman and user-systemd operations as `podman_user` with the
+  shared runtime environment.
+- Use the account's passwd home directory instead of assuming `/home/<user>`.
+- Validate before promotion for SSH, nftables, Caddy, and Quadlets.
+- Keep reusable code, comments, examples, tests, and documentation free of
+  deployment-specific hostnames, inventory names, and workload names.
 
-containers:
-  - name: frontend
-    image: lscr.io/linuxserver/bookstack:latest
-    networks: ["{{ pod.ingress_network }}"]
-    volumes:
-      - type: volume
-        name: bookstack-data
-        destination: /var/www/bookstack/storage
-    depends_on: [db]
+## Verification
 
-  - name: admin
-    image: mycompany/admin-tool:latest
-    networks: ["{{ pod.ingress_network }}"]
-    proxy_paths: ["/admin", "/admin/*"]
-
-  - name: db
-    image: mariadb:10.11
-    networks: ["{{ pod.internal_network }}"]
-    volumes:
-      - type: volume
-        name: db-data
-        destination: /var/lib/mysql
-```
-
-**Static site example** (Hugo blog)
-
-```yaml
-app_name: blog
-host: blr1.adityaj.in
-app_root: "{{ data_mount }}/apps/blog"
-
-type: static
-
-ingress:
-  main_domain: blog.adityaj.in
-  tls: true
-  caddy_directives: |
-    encode zstd gzip
-    header Cache-Control "public, max-age=86400"
-```
-
-**Mixed app example** (container + static assets)
-
-```yaml
-app_name: myapp
-host: blr1.adityaj.in
-app_root: "{{ data_mount }}/apps/myapp"
-
-type: container
-
-pod:
-  name: myapp
-  ingress_network: myapp-ingress-net
-
-ingress:
-  main_domain: myapp.adityaj.in
-  tls: true
-
-# Static paths served from /srv/data/static/myapp/public
-static_paths:
-  - path: "/static/*"
-    root: "assets"  # serves from /srv/data/static/myapp/public/assets
-    strip_prefix: true
-  - path: "/docs"
-    root: "docs"    # serves from /srv/data/static/myapp/public/docs
-    strip_prefix: false
-  - path: "/images/*"
-    strip_prefix: true  # uses default root: /srv/data/static/myapp/public
-
-containers:
-  - name: api
-    image: mycompany/api:latest
-    proxy_paths: ["/*"]
-```
-
-**Static-only with subpath** (if static files are in a subdirectory)
-
-```yaml
-app_name: docs
-host: blr1.adityaj.in
-
-type: static
-
-ingress:
-  main_domain: docs.adityaj.in
-  tls: true
-  caddy_directives: |
-    # Override root to serve from a subdirectory
-    root * /srv/data/static/docs/public/docs
-    file_server
-```
-
-### 4. Caddy as System Service
-- Quadlet mounts:
-  ```
-  Volume=/srv/data/system/ingress/caddy/config:/etc/caddy:rw,Z,U
-  Volume=/srv/data/system/ingress/caddy/data:/data:rw,Z,U
-  Volume=/srv/data/static:/srv/data/static:ro,U,Z
-  ```
-- Static files location: `/srv/data/static/{app}/public` (read-only mount)
-- Snippet example (generated):
-  ```caddy
-  wiki.adityaj.in {
-    tls internal
-
-    handle / {
-      reverse_proxy wiki-frontend:80
-    }
-
-    handle /admin/* {
-      reverse_proxy wiki-admin:8080
-    }
-
-    encode zstd gzip
-    header Strict-Transport-Security "max-age=31536000;"
-  }
-  ```
-- Static site snippet:
-  ```caddy
-  blog.adityaj.in {
-    root * /srv/data/apps/blog/public
-    file_server
-    encode zstd gzip
-  }
-  ```
-- Always reload: `caddy reload --config /etc/caddy/Caddyfile`
-
-### 5. Lifecycle Guidelines
-- `app_manage.yml`: host-filtered via `--limit`, confirmation on destroy
-- `app_migrate.yml`: stop → rsync `/srv/data/apps/<app>` & `/srv/data/system/ingress/caddy/config` (if needed) → cleanup source → start target
-- Destroy: disconnect Caddy → remove nets → rm quadlets/volumes/snippet → rm data dir (confirm by typing app_name)
-
-### 6. Code Style & Ansible Patterns
-- FQCN always
-- `loop` + `loop_control` preferred
-- `become_user: "{{ podman_user }}"` for user tasks
-- Idempotency: `creates`, `changed_when: false`, check-before-act
-- Commit: `<type>(<app>): description` e.g. `fix(blog): preserve ownership on static sync`
-
-### 7. Boundaries – Never Do These
-- No shared networks
-- Avoid port publishing to host unless there is no viable alternative through Caddy or per-app network routing. Any exception must be explicit in `app.yml`, app-scoped, justified by protocol limitations (for example Git SSH), and should use an unprivileged port unless a stronger reason is documented.
-- No rootful Podman
-- No Caddy restart — reload only
-- No data outside `/srv/data`
-- No manual edits outside Ansible
-
-### 8. Quick Commands
-```bash
-ansible-playbook app_manage.yml -e "app=wiki operation=start" --limit blr1.adityaj.in
-ansible-playbook app_migrate.yml -e "app=blog source_host=blr1 target_host=blr2"
-journalctl --user -u caddy -f
-podman network ls | grep ingress
-```
-
-**Improvement note**:  
-These guidelines and examples are the current agreed baseline.  
-During development, agents may propose refinements (e.g. better error handling in migration, additional hardening, metrics integration) — but **only** after explaining impact on isolation, rootless safety, migration, and reload behavior.
-
-Thank you for contributing to a clean, durable, production-grade platform! Remember always put on a Principal Architect hat on, and assume a single person startup - must be secure, must need minimal maintenance, must be easy to recall in times of crisis. Consistency in pattern is important.
+Run playbook syntax checks, `ansible-lint`, and compile the consuming catalog
+with `tools/compile_app_model.py --apps-root <apps-root> --check`.
+The old test suites were removed during the rewrite; replacement coverage is
+tracked in `TODO.md`. Host-affecting changes require idempotency, reboot
+persistence, network isolation, and graceful Caddy reload checks on a disposable
+supported host. Do not claim runtime verification based on syntax checks alone.

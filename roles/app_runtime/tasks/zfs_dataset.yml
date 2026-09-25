@@ -1,0 +1,135 @@
+---
+- name: Inspect managed ZFS dataset
+  ansible.builtin.command:
+    argv:
+      - zfs
+      - list
+      - -H
+      - -o
+      - name
+      - "{{ app_runtime_zfs_dataset_name }}"
+  register: app_runtime_existing_zfs_dataset
+  changed_when: false
+  failed_when: app_runtime_existing_zfs_dataset.rc not in [0, 1]
+
+- name: Read existing managed ZFS dataset mountpoint
+  ansible.builtin.command:
+    argv:
+      - zfs
+      - get
+      - -H
+      - -o
+      - value
+      - mountpoint
+      - "{{ app_runtime_zfs_dataset_name }}"
+  register: app_runtime_existing_zfs_mountpoint
+  changed_when: false
+  when: app_runtime_existing_zfs_dataset.rc == 0
+
+- name: Check managed ZFS mount path
+  ansible.builtin.stat:
+    path: "{{ app_runtime_zfs_dataset_path }}"
+    follow: false
+  register: app_runtime_zfs_path
+
+- name: Inspect managed ZFS mount source
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE
+      - --mountpoint
+      - "{{ app_runtime_zfs_dataset_path }}"
+  register: app_runtime_zfs_mount_source
+  changed_when: false
+  failed_when: app_runtime_zfs_mount_source.rc not in [0, 1]
+
+- name: Inspect unmounted managed ZFS path contents
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/find
+      - "{{ app_runtime_zfs_dataset_path }}"
+      - -mindepth
+      - "1"
+      - -maxdepth
+      - "1"
+      - -print
+      - -quit
+  register: app_runtime_zfs_path_contents
+  changed_when: false
+  when:
+    - app_runtime_zfs_path.stat.exists
+    - app_runtime_zfs_mount_source.rc != 0
+
+- name: Require safe managed ZFS mount path
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not app_runtime_zfs_path.stat.exists or app_runtime_zfs_path.stat.isdir
+      - not app_runtime_zfs_path.stat.exists or not app_runtime_zfs_path.stat.islnk
+      - >-
+        app_runtime_existing_zfs_dataset.rc != 0
+        or app_runtime_existing_zfs_mountpoint.stdout == app_runtime_zfs_dataset_path
+      - >-
+        app_runtime_zfs_mount_source.rc != 0
+        or app_runtime_zfs_mount_source.stdout.split() ==
+           [app_runtime_zfs_dataset_name, 'zfs']
+      - >-
+        not app_runtime_zfs_path.stat.exists
+        or app_runtime_zfs_mount_source.rc == 0
+        or app_runtime_zfs_path_contents.stdout | length == 0
+    fail_msg: >-
+      Refusing to relocate a dataset, cover another mount, or cover a non-empty
+      directory at {{ app_runtime_zfs_dataset_path }}.
+
+- name: Create managed ZFS dataset
+  community.general.zfs:
+    name: "{{ app_runtime_zfs_dataset_name }}"
+    state: present
+    extra_zfs_properties: >-
+      {{ {'canmount': 'on', 'mountpoint': app_runtime_zfs_dataset_path}
+         | combine(app_runtime_zfs_dataset_properties) }}
+  when: not app_runtime_zfs_inspect_only | default(false)
+
+- name: Inspect reconciled managed ZFS mount source
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE
+      - --mountpoint
+      - "{{ app_runtime_zfs_dataset_path }}"
+  register: app_runtime_reconciled_zfs_mount_source
+  changed_when: false
+  failed_when: app_runtime_reconciled_zfs_mount_source.rc not in [0, 1]
+  when: not app_runtime_zfs_inspect_only | default(false)
+
+- name: Mount existing managed ZFS dataset
+  ansible.builtin.command:
+    argv:
+      - zfs
+      - mount
+      - "{{ app_runtime_zfs_dataset_name }}"
+  changed_when: true
+  when:
+    - not app_runtime_zfs_inspect_only | default(false)
+    - app_runtime_reconciled_zfs_mount_source.rc != 0
+
+- name: Verify managed ZFS mount source
+  ansible.builtin.command:
+    argv:
+      - findmnt
+      - --noheadings
+      - --output
+      - SOURCE,FSTYPE
+      - --mountpoint
+      - "{{ app_runtime_zfs_dataset_path }}"
+  register: app_runtime_final_zfs_mount_source
+  changed_when: false
+  failed_when:
+    - app_runtime_final_zfs_mount_source.rc != 0 or
+      app_runtime_final_zfs_mount_source.stdout.split() !=
+      [app_runtime_zfs_dataset_name, 'zfs']
+  when: not app_runtime_zfs_inspect_only | default(false)

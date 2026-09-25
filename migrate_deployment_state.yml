@@ -1,0 +1,46 @@
+---
+# Needed only if the previous executor left a pending-apply.json on a host.
+# Import its resource ownership, not its uncommitted assignment or refresh state.
+- name: Retire obsolete deployment transaction records
+  hosts: app_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read obsolete pending deployment record
+      ansible.builtin.slurp:
+        src: /var/lib/ansible-app-host/pending-apply.json
+      register: obsolete_pending
+      failed_when: >-
+        obsolete_pending.failed | default(false)
+        and 'file not found' not in (obsolete_pending.msg | default('') | lower)
+
+    - name: Preserve ownership before retiring old transaction state
+      when: obsolete_pending.content is defined
+      block:
+        - name: Read existing host ownership manifest
+          ansible.builtin.slurp:
+            src: /var/lib/ansible-app-host/host-state.json
+          register: existing_manifest
+          failed_when: >-
+            existing_manifest.failed | default(false)
+            and 'file not found' not in (existing_manifest.msg | default('') | lower)
+
+        - name: Merge resource names into the ownership ledger
+          ansible.builtin.copy:
+            content: >-
+              {% set state = existing_manifest.content | b64decode | from_json
+                 if existing_manifest.content is defined else {} %}
+              {% set pending = obsolete_pending.content | b64decode | from_json %}
+              {% for key in ['all_host_services', 'all_host_containers', 'all_host_networks', 'quadlets', 'caddy_sites'] %}
+              {% set _ = state.update({key: (state.get(key, []) + pending.get(key, [])) | unique | sort}) %}
+              {% endfor %}
+              {{ state | to_nice_json }}
+            dest: /var/lib/ansible-app-host/host-state.json
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Remove obsolete pending record after ownership is saved
+          ansible.builtin.file:
+            path: /var/lib/ansible-app-host/pending-apply.json
+            state: absent

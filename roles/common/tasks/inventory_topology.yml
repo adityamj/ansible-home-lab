@@ -1,0 +1,23 @@
+---
+- name: Initialize complete application inventory topology
+  ansible.builtin.set_fact:
+    app_inventory_topology: {}
+
+- name: Collect assignments and draining declarations from every application host
+  ansible.builtin.set_fact:
+    app_inventory_topology: >-
+      {{ app_inventory_topology | combine({item: {
+          'assigned_apps': hostvars[item].assigned_apps | default([]),
+          'draining_apps': hostvars[item].draining_apps | default({}),
+          'outgoing_migrations': hostvars[item].outgoing_migrations | default({}),
+          'incoming_migrations': hostvars[item].incoming_migrations | default({})
+        }}) }}
+  loop: "{{ groups['app_hosts'] | default([]) | sort }}"
+  no_log: true
+
+- name: Require complete application host inventory visibility
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - app_inventory_topology | length == groups['app_hosts'] | default([]) | length
+    fail_msg: "The compiler requires every app_hosts declaration even when --limit filters execution."

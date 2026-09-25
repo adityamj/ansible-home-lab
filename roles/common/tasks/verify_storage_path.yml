@@ -1,0 +1,41 @@
+---
+- name: Canonicalize persistent storage root
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ data_mount }}"
+  register: canonical_data_mount
+  changed_when: false
+  check_mode: false
+  failed_when: canonical_data_mount.rc != 0 or canonical_data_mount.stdout != data_mount
+
+- name: Inspect persistent storage root path
+  ansible.builtin.stat:
+    path: "{{ data_mount }}"
+    follow: false
+  register: verified_data_mount
+
+- name: Reject unsafe persistent storage root path
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not verified_data_mount.stat.exists or verified_data_mount.stat.isdir
+      - not verified_data_mount.stat.exists or not verified_data_mount.stat.islnk
+    fail_msg: "data_mount '{{ data_mount }}' is not a safe directory path."
+
+# util-linux mountpoint returns 32 for an existing non-mountpoint; 1 is an
+# inspection error (including a missing path), not proof of plain storage.
+- name: Require existing plain storage root not to be a mountpoint
+  ansible.builtin.command:
+    argv:
+      - mountpoint
+      - --quiet
+      - "{{ data_mount }}"
+  register: plain_storage_mount_status
+  changed_when: false
+  check_mode: false
+  failed_when: plain_storage_mount_status.rc != 32
+  when:
+    - storage_mode == 'plain'
+    - verified_data_mount.stat.exists

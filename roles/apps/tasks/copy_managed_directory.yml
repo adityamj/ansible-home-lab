@@ -1,0 +1,81 @@
+---
+# Only for rendered artifacts and declarative configuration, never writable data.
+# The controller supplies exact regular-file/directory membership. Removing stale
+# entries explicitly preserves rsync --delete semantics without another SSH client.
+- name: Require a canonical managed copy destination
+  ansible.builtin.command:
+    argv: [realpath, -m, "{{ directory_sync_dest }}"]
+  register: directory_sync_canonical
+  changed_when: false
+  # A trailing slash is harmless; symlinks, relative paths and dot components
+  # still fail. Use the checked result below so manifest paths never contain //.
+  failed_when: >-
+    directory_sync_canonical.rc != 0
+    or directory_sync_canonical.stdout != directory_sync_dest | regex_replace('/+$', '')
+
+- name: Ensure managed copy root has consistent ownership and permissions
+  ansible.builtin.file:
+    path: "{{ directory_sync_canonical.stdout }}"
+    state: directory
+    owner: "{{ directory_sync_owner }}"
+    group: "{{ directory_sync_group }}"
+    mode: "{{ directory_sync_directory_mode }}"
+  register: directory_sync_root
+
+- name: Inventory managed destination entries without following links
+  ansible.builtin.find:
+    paths: "{{ directory_sync_canonical.stdout }}"
+    recurse: true
+    hidden: true
+    follow: false
+    file_type: any
+  register: directory_sync_existing
+
+- name: Remove obsolete or incompatible managed entries
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ directory_sync_existing.files | sort(attribute='path', reverse=true) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  vars:
+    desired_directories: "{{ directory_sync_directories | map('regex_replace', '^', directory_sync_canonical.stdout ~ '/') | list }}"
+    desired_files: "{{ directory_sync_files | map('regex_replace', '^', directory_sync_canonical.stdout ~ '/') | list }}"
+  when: >-
+    not (item.isdir and item.path in desired_directories)
+    and not (item.isreg and item.nlink == 1 and item.path in desired_files)
+  register: directory_sync_removed
+
+- name: Ensure declared managed directories including empty directories
+  ansible.builtin.file:
+    path: "{{ directory_sync_canonical.stdout }}/{{ item }}"
+    state: directory
+    owner: "{{ directory_sync_owner }}"
+    group: "{{ directory_sync_group }}"
+    mode: "{{ directory_sync_directory_mode }}"
+  loop: "{{ directory_sync_directories | reject('equalto', '') | list }}"
+  register: directory_sync_created
+
+# Directory metadata belongs exclusively to the file tasks above. Avoid recursive
+# copy's directory handling, which can vary between Ansible versions.
+- name: Copy managed files over the existing Ansible connection
+  ansible.builtin.copy:
+    src: "{{ directory_sync_src }}/{{ item }}"
+    dest: "{{ directory_sync_canonical.stdout }}/{{ item }}"
+    owner: "{{ directory_sync_owner }}"
+    group: "{{ directory_sync_group }}"
+    mode: "{{ directory_sync_file_mode }}"
+    local_follow: false
+    follow: false
+  loop: "{{ directory_sync_files }}"
+  loop_control:
+    label: "{{ item }}"
+  register: directory_sync_copied
+
+- name: Accumulate mounted configuration changes for application refresh
+  ansible.builtin.set_fact:
+    managed_config_dirs_changed: >-
+      {{ managed_config_dirs_changed | default(false)
+         or directory_sync_root.changed or directory_sync_removed.changed
+         or directory_sync_created.changed or directory_sync_copied.changed }}
+  when: directory_sync_track_runtime | default(false)

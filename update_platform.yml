@@ -1,0 +1,5 @@
+---
+# Explicit platform reconciliation shares bootstrap's implementation. Existing
+# app firewall allowances are preserved; app containers are not deployed here.
+- name: Update platform baseline
+  ansible.builtin.import_playbook: bootstrap.yml

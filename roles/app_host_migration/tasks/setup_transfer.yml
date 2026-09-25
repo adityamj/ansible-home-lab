@@ -1,0 +1,151 @@
+---
+- name: Require restricted rsync receiver on target
+  ansible.builtin.stat:
+    path: /usr/bin/rrsync
+    follow: false
+  register: migration_rrsync
+  when: inventory_hostname == target_host
+
+- name: Refuse transfer without packaged rrsync
+  ansible.builtin.assert:
+    that:
+      - migration_rrsync.stat.isreg | default(false)
+      - not migration_rrsync.stat.islnk | default(false)
+      - migration_rrsync.stat.uid | default(-1) == 0
+  when: inventory_hostname == target_host
+
+- name: Read target SSH host identity over existing verified Ansible transport
+  ansible.builtin.slurp:
+    src: /etc/ssh/ssh_host_ed25519_key.pub
+  register: migration_target_host_key_raw
+  when: inventory_hostname == target_host
+
+- name: Publish target SSH host identity
+  ansible.builtin.set_fact:
+    migration_target_host_key: "{{ (migration_target_host_key_raw.content | b64decode).split()[0:2] | join(' ') }}"
+  when: inventory_hostname == target_host
+
+- name: Ensure private source transfer state directory
+  ansible.builtin.file:
+    path: "{{ migration_transfer_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+  when: inventory_hostname == source_host
+
+- name: Generate migration-specific volume transfer key
+  ansible.builtin.command:
+    argv: [ssh-keygen, -q, -t, ed25519, -N, '', -C, "migration-{{ migration_id }}-volumes", -f, "{{ migration_transfer_key_path }}"]
+    creates: "{{ migration_transfer_key_path }}"
+  when:
+    - inventory_hostname == source_host
+    - migration_volume_names | length > 0
+
+- name: Generate migration-specific static transfer key
+  ansible.builtin.command:
+    argv: [ssh-keygen, -q, -t, ed25519, -N, '', -C, "migration-{{ migration_id }}-static", -f, "{{ migration_static_transfer_key_path }}"]
+    creates: "{{ migration_static_transfer_key_path }}"
+  when:
+    - inventory_hostname == source_host
+    - migration_has_static_data | bool
+
+- name: Read volume transfer public key
+  ansible.builtin.slurp:
+    src: "{{ migration_transfer_key_path }}.pub"
+  register: migration_transfer_public_key_raw
+  when:
+    - inventory_hostname == source_host
+    - migration_volume_names | length > 0
+
+- name: Publish volume transfer public key
+  ansible.builtin.set_fact:
+    migration_transfer_public_key: "{{ migration_transfer_public_key_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == source_host
+    - migration_volume_names | length > 0
+
+- name: Read static transfer public key
+  ansible.builtin.slurp:
+    src: "{{ migration_static_transfer_key_path }}.pub"
+  register: migration_static_transfer_public_key_raw
+  when:
+    - inventory_hostname == source_host
+    - migration_has_static_data | bool
+
+- name: Publish static transfer public key
+  ansible.builtin.set_fact:
+    migration_static_transfer_public_key: "{{ migration_static_transfer_public_key_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == source_host
+    - migration_has_static_data | bool
+
+- name: Pin target host identity exclusively for migration transfer
+  ansible.builtin.copy:
+    dest: "{{ migration_transfer_known_hosts_path }}"
+    content: |
+      {{ target_host }} {{ hostvars[target_host].migration_target_host_key }}
+      {{ migration_target_address }} {{ hostvars[target_host].migration_target_host_key }}
+    owner: root
+    group: root
+    mode: '0600'
+  when: inventory_hostname == source_host
+
+- name: Compute short-lived receiver expiry on controller
+  ansible.builtin.command:
+    argv: [date, -u, -d, '+2 hours', '+%Y%m%d%H%M%SZ']
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  register: migration_transfer_expiry_command
+
+- name: Publish receiver expiry to both hosts
+  ansible.builtin.set_fact:
+    migration_transfer_expiry: "{{ migration_transfer_expiry_command.stdout }}"
+
+- name: Install expiring forced write-only volume receiver key
+  ansible.posix.authorized_key:
+    user: root
+    state: present
+    exclusive: false
+    key: "{{ hostvars[source_host].migration_transfer_public_key }}"
+    key_options: >-
+      restrict,expiry-time="{{ migration_transfer_expiry }}",command="/usr/bin/rrsync -wo {{ data_mount }}/apps/{{ migration_app }}/volumes"
+  when:
+    - inventory_hostname == target_host
+    - migration_volume_names | length > 0
+
+- name: Install expiring forced static receiver key
+  ansible.posix.authorized_key:
+    user: root
+    state: present
+    exclusive: false
+    key: "{{ hostvars[source_host].migration_static_transfer_public_key }}"
+    key_options: >-
+      restrict,expiry-time="{{ migration_transfer_expiry }}",command="/usr/bin/rrsync -wo {{ migration_static_root }}"
+  when:
+    - inventory_hostname == target_host
+    - migration_has_static_data | bool
+
+- name: Verify temporary receiver authentication before rsync
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/ssh
+      - -i
+      - "{{ item }}"
+      - -o
+      - "UserKnownHostsFile={{ migration_transfer_known_hosts_path }}"
+      - -o
+      - IdentitiesOnly=yes
+      - -o
+      - StrictHostKeyChecking=yes
+      - -o
+      - BatchMode=yes
+      - "{{ migration_transfer_destination }}"
+      - 'true'
+  loop: >-
+    {{ ([migration_transfer_key_path] if migration_volume_names | length > 0 else [])
+       + ([migration_static_transfer_key_path] if migration_has_static_data | bool else []) }}
+  changed_when: false
+  when: inventory_hostname == source_host

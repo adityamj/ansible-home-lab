@@ -1,0 +1,200 @@
+---
+- name: Build globally visible application topology before rendering
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/inventory_topology.yml"
+
+- name: Render desired host artifacts on controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../tools/render_host_artifacts.py"
+      - --apps-root
+      - "{{ apps_root }}"
+      - --artifact-root
+      - "{{ app_artifact_local_dir }}"
+    stdin: >-
+      {{ {
+          'assigned_apps': app_model_assigned_apps | default(assigned_apps | default([])),
+          'app_desired_states': app_model_desired_states | default(app_desired_states | default({})),
+          'draining_apps': draining_apps | default({}),
+          'inventory_hosts': app_inventory_topology,
+          'current_host': inventory_hostname,
+          'selected_hosts': ansible_play_hosts_all | default([]),
+          'target_app': target_app | default(''),
+          'ssh_port': ssh_port,
+          'podman_user': podman_user,
+          'data_mount': data_mount,
+          'caddy_static_mount_path': caddy_static_mount_path,
+          'caddy_platform_network': caddy_platform_network | default('caddy-egress-net'),
+          'caddy_tls_default': caddy_tls_default | default(true),
+          'caddy_tls_override': caddy_tls_override | default('__UNSET__'),
+          'defaults': {
+            'memory_max': app_memory_default,
+            'pids_limit': app_pids_limit_default,
+            'restart_policy': app_restart_policy,
+            'restart_sec': app_restart_sec,
+            'healthcheck': app_healthcheck_defaults,
+            'runtime_healthcheck': app_runtime_healthcheck_defaults
+          }
+        } | to_json }}
+    stdin_add_newline: true
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  register: rendered_app_artifacts
+
+- name: Publish rendered apply plan facts
+  ansible.builtin.set_fact:
+    app_apply_plan: "{{ rendered_app_artifacts.stdout | from_json }}"
+    deployment_is_targeted: "{{ (target_app | default('') | string | trim | length) > 0 }}"
+
+- name: Load committed host state before changes
+  ansible.builtin.slurp:
+    src: "{{ app_artifact_previous_path }}"
+  register: previous_host_state_raw
+  failed_when: previous_host_state_raw.failed | default(false) and 'file not found' not in (previous_host_state_raw.msg | default('') | lower)
+
+- name: Decode committed host state
+  ansible.builtin.set_fact:
+    previous_host_state: >-
+      {{ (previous_host_state_raw.content | b64decode | from_json)
+         if previous_host_state_raw.content is defined else {} }}
+
+- name: Require committed host state when preserving synthetic assignment
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - previous_host_state.assigned_apps is defined
+      - previous_host_state.assigned_apps_digest is defined
+      - previous_host_state.naming_scheme is defined
+    fail_msg: "Run a full deployment on this host before migration staging with synthetic app assignment."
+  when: app_model_preserve_committed_assignment | default(false) | bool
+
+- name: Require committed assignment and naming scheme for targeted deployment
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - previous_host_state.assigned_apps_digest | default('') == app_apply_plan.assigned_apps_digest
+      - previous_host_state.naming_scheme | default('') == app_apply_plan.naming_scheme
+    fail_msg: "Run a full deployment after assignment or naming changes."
+  when:
+    - deployment_is_targeted
+    - not (app_model_allow_uncommitted_assignment | default(false) | bool)
+
+- name: Require full deployment when tracked runtime resources are removed
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - previous_host_state.all_host_containers | default([]) | difference(app_apply_plan.all_host_containers) | length == 0
+      - previous_host_state.all_host_networks | default([]) | difference(app_apply_plan.all_host_networks) | length == 0
+      - previous_host_state.all_host_units | default([]) | difference(app_apply_plan.all_host_units) | length == 0
+    fail_msg: "Runtime resources were removed or renamed. Run a full deploy to retire old writers before starting replacements."
+  when: deployment_is_targeted
+
+- name: Require full deployment for firewall allocation changes
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - previous_host_state.published_ports | default([]) == app_apply_plan.published_ports
+    fail_msg: "Published ports changed. Run a full deploy to reconcile firewall rules and app services together."
+  when:
+    - deployment_is_targeted
+    - not (app_reconcile_targeted_firewall | default(false) | bool)
+    - not (app_model_allow_uncommitted_assignment | default(false) | bool)
+
+- name: Validate narrowly scoped synthetic assignment exception
+  ansible.builtin.assert:
+    that:
+      - deployment_is_targeted
+      - app_model_preserve_committed_assignment | bool
+      - previous_host_state.naming_scheme | default('') == app_apply_plan.naming_scheme
+      - previous_host_state.assigned_apps | default([]) | difference(migration_runtime_baseline) | length == 0
+      - assigned_apps | default([]) | difference((previous_host_state.assigned_apps | default([])) + (migration_overlay_apps | default([])) + (draining_apps | default({}) | list)) | length == 0
+      - migration_assignment_baseline | difference(app_apply_plan.assigned_apps) | length == 0
+      - >-
+        app_apply_plan.assigned_apps | difference(migration_assignment_baseline)
+        == ([] if app_model_migration_source_transition | default(false) | bool else [target_app])
+    fail_msg: >-
+      Synthetic assignment may only add the targeted migration app. Every other
+      inventory/ledger difference must be explained by an active migration record.
+  vars:
+    migration_assignment_baseline: "{{ ((assigned_apps | default([])) + (migration_overlay_apps | default([]))) | unique | sort }}"
+    migration_runtime_baseline: "{{ (migration_assignment_baseline + (draining_apps | default({}) | list)) | unique | sort }}"
+  when: app_model_allow_uncommitted_assignment | default(false) | bool
+
+- name: Defer synthetic firewall changes only while all selected services are inactive
+  ansible.builtin.assert:
+    that:
+      - app_reconcile_targeted_firewall | default(false) | bool or app_apply_plan.running_services | length == 0
+    fail_msg: "A running synthetic assignment with changed ports must reconcile the complete target firewall plan."
+  when:
+    - app_model_allow_uncommitted_assignment | default(false) | bool
+    - previous_host_state.published_ports | default([]) != app_apply_plan.published_ports
+
+- name: Ensure deployment metadata directories
+  loop_control:
+    label: "{{ item.path }}"
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - path: "{{ apps_control_state_dir }}"
+      group: "{{ podman_group }}"
+      mode: "0750"
+    - path: "{{ secret_hash_dir }}"
+      group: root
+      mode: "0700"
+    - path: "{{ app_artifact_remote_dir }}"
+      group: "{{ podman_group }}"
+      mode: "0750"
+    - path: "{{ podman_quadlet_dir }}"
+      group: root
+      mode: "0755"
+    - path: "{{ podman_quadlet_dir }}/caddy.container.d"
+      group: root
+      mode: "0755"
+    - path: "{{ podman_user_unit_dir }}"
+      group: root
+      mode: "0755"
+
+# One persistent ownership ledger. Record names before creating resources, but
+# leave successful assignment/port metadata unchanged until deployment finishes.
+# A rerun can garbage-collect partially created resources without a transaction.
+- name: Collect resource ownership for this deployment
+  ansible.builtin.set_fact:
+    app_recorded_ownership: >-
+      {%- set owned = {} -%}
+      {%- for saved, desired in {'all_host_services': 'services',
+                                'all_host_containers': 'containers',
+                                'all_host_networks': 'networks',
+                                'all_host_units': 'units', 'quadlets': 'quadlets',
+                                'caddy_sites': 'caddy_sites'}.items() -%}
+      {%- set _ = owned.update({saved: (previous_host_state.get(saved, []) + app_apply_plan[desired]) | unique | sort}) -%}
+      {%- endfor -%}
+      {{ owned }}
+
+- name: Record ownership before creating app resources
+  ansible.builtin.copy:
+    content: "{{ previous_host_state | combine(app_recorded_ownership) | to_nice_json }}\n"
+    dest: "{{ app_artifact_previous_path }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Validate canonical writable and managed configuration paths
+  ansible.builtin.command:
+    argv: [realpath, -m, "{{ managed_path }}"]
+  loop: >-
+    {{ (app_apply_plan.volume_dirs | map(attribute='path') | list)
+       + (app_apply_plan.static_dirs | default([]))
+       + (app_apply_plan.mounts | map(attribute='dest') | list) }}
+  loop_control:
+    loop_var: managed_path
+  register: canonical_managed_path
+  changed_when: false
+  failed_when: >-
+    canonical_managed_path.rc != 0
+    or canonical_managed_path.stdout != managed_path | regex_replace('/+$', '')

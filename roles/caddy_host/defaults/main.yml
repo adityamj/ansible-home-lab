@@ -6,10 +6,6 @@ podman_group: podman
 # Caddy container image
 caddy_image: "docker.io/library/caddy:2-alpine"
 
-# Caddy container user (UID:GID inside container, for ownership)
-# Official Caddy image runs as root by default
-caddy_container_user: "0:0"
-
 # Base directory for all persistent data
 # (override in group_vars/all/main.yml)
 data_mount: "/srv/data"
@@ -25,16 +21,25 @@ caddy_admin_email: ""
 
 # Static files base path (read-only mount for serving static content)
 static_base_path: "{{ data_mount }}/static"
+caddy_static_mount_path: /srv/static
 
-# Controller path to app definitions directory.
-# Defaults to "apps" for backward compatibility; override with an absolute path in control repos.
-apps_root: "apps"
+# Controller path to app definitions directory
+apps_root: "{{ playbook_dir }}/apps"
 
 # Resource limits for Caddy container
 caddy_memory_max: "512M"
+caddy_pids_limit: 512
 caddy_cpu_quota: "30%"
 caddy_cpu_weight: 2048
 
 # Default systemd restart behavior for the Caddy Quadlet service.
 caddy_restart_policy: "on-failure"
 caddy_restart_sec: "5s"
+
+caddy_host_staging_dir: /var/lib/ansible-app-host/caddy
+caddy_platform_network: caddy-egress-net
+apps_control_state_dir: /var/lib/ansible-app-host
+podman_user_unit_dir: /etc/systemd/user
+caddy_host_quadlet_generator_paths:
+  - /usr/lib/systemd/system-generators/podman-system-generator
+  - /usr/local/lib/systemd/system-generators/podman-system-generator

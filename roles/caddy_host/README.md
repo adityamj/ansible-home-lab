@@ -1,23 +1,19 @@
 # Caddy Host Role
 
-This role deploys Caddy as a rootless Podman Quadlet container for ingress routing to apps.
+This role establishes one rootless Caddy Quadlet per application host.
 
-## Config Structure
+It creates the persistent configuration, certificate, runtime configuration,
+log, and static-content directories beneath `data_mount`. The Caddy
+configuration mount is read-only inside the container; only certificate and
+runtime storage remain writable.
 
-- **Main Caddyfile**: `/srv/data/system/ingress/caddy/config/Caddyfile` - Global settings, imports snippets and sites.
-- **Snippets**: `/srv/data/system/ingress/caddy/config/snippets/` - Shared directives (e.g., security headers).
-- **Sites**: `/srv/data/system/ingress/caddy/config/sites-enabled/` - Per-app site configs (auto-generated).
+The base Caddy Quadlet does not enumerate app networks. The apps role owns
+per-app source drop-ins under `caddy.container.d/` and live network attachment.
+A companion `caddy-pasta.service` owns TCP 80/443 and UDP 443 directly in
+Caddy's network namespace, preserving client addresses without `rootlessport`.
 
-## Customization
-
-- Add shared snippets in `snippets/*.caddy`.
-- Per-app custom directives via `ingress.caddy_directives` in `apps/<app>/app.yml`.
-
-## Validation
-
-Config is validated via container before reload to prevent downtime.
-
-## Troubleshooting
-
-- Check logs: `podman logs caddy`
-- Validate manually: `podman run --rm -v /srv/data/system/ingress/caddy/config:/etc/caddy:ro caddy:2-alpine caddy validate`
+Global and app configuration is staged, validated with the configured Caddy
+image, and promoted before a graceful reload through the Unix admin socket.
+Routine deployment never restarts Caddy. Changing the platform Quadlet may
+perform a controlled restart, including the one-time migration away from
+`PublishPort=`.

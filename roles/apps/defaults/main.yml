@@ -1,4 +1,30 @@
 ---
+# Trust unchanged configuration by default. Set true to refresh selected apps
+# and ingress after interruption or when runtime state is uncertain.
+force_refresh: false
+
+# Host-specific app activation overrides (catalog default: desired_state: running).
+# Keys must be assigned apps; values are running or inactive.
+app_desired_states: {}
+
+# Migration/internal overrides. Normal deployments leave these undefined/false.
+# app_model_assigned_apps and app_model_desired_states provide synthetic compiler
+# input without changing inventory ownership. app_model_allow_uncommitted_assignment
+# permits targeted staging for such a synthetic assignment; app_model_preserve_
+# committed_assignment prevents the synthetic assignment digest from being saved
+# as steady-state host ownership.
+app_model_allow_uncommitted_assignment: false
+app_model_preserve_committed_assignment: false
+app_model_migration_source_transition: false
+# Set only by migrate_app_host.yml after globally validating paired host intent.
+app_migration_execution: false
+# Migration may reconcile only the declared volume root inode (never contents)
+# when that root was created by the migration before copied data arrived.
+app_reconcile_migration_volume_roots: false
+# Migration may opt a targeted synthetic full-host plan into the same firewall
+# reconciliation used by ordinary full deployment. Normal targeted deploys do not.
+app_reconcile_targeted_firewall: false
+
 # Podman user/group (should match app_runtime)
 podman_user: podman
 podman_group: podman
@@ -6,25 +32,26 @@ podman_group: podman
 # Base directory for all persistent data
 # (override in group_vars/all/main.yml)
 data_mount: "/srv/data"
+use_zpool: ""
 
 # Base directory for app data
 app_data_base_path: "{{ data_mount }}/apps"
 
-# Controller path to app definitions directory.
-# Defaults to "apps" for backward compatibility; override with an absolute path in control repos.
-apps_root: "apps"
+# Controller path to app definitions directory. Consuming repositories should
+# set this from their top-level inventory or playbook. The default is suitable
+# only when a standalone checkout keeps app definitions beside the playbook.
+apps_root: "{{ playbook_dir }}/apps"
+app_model_compiler_path: "{{ role_path }}/../../tools/compile_app_model.py"
 
 # Static files base path (read-only mount in Caddy)
 static_base_path: "{{ data_mount }}/static"
+caddy_static_mount_path: /srv/static
 
 # Caddy config directory for site configs
 caddy_config_dir: "{{ data_mount }}/system/ingress/caddy/config"
 
 # Caddy container image (for validation)
 caddy_image: "docker.io/library/caddy:2-alpine"
-
-# Caddy container user (for ownership fix)
-caddy_container_user: "0:0"
 
 # Default ingress health/retry tuning for app backends.
 # These are only applied when a container declares a healthcheck block.
@@ -55,5 +82,12 @@ app_runtime_healthcheck_defaults:
 app_restart_policy: "on-failure"
 app_restart_sec: "5s"
 
-# Optional: limit deployment to a single app
-# target_app: ""
+app_memory_default: "512M"
+app_pids_limit_default: 512
+
+quadlet_generator_paths:
+  - /usr/lib/systemd/system-generators/podman-system-generator
+  - /usr/local/lib/systemd/system-generators/podman-system-generator
+caddy_platform_network: caddy-egress-net
+apps_control_state_dir: /var/lib/ansible-app-host
+podman_user_unit_dir: /etc/systemd/user

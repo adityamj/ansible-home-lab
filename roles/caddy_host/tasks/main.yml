@@ -1,80 +1,523 @@
 ---
+- name: Validate Caddy storage paths
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - caddy_config_dir == data_mount + '/system/ingress/caddy/config'
+      - caddy_data_dir == data_mount + '/system/ingress/caddy/data'
+      - caddy_config_storage_dir == data_mount + '/system/ingress/caddy/storage'
+      - caddy_log_dir == data_mount + '/system/ingress/caddy/logs'
+      - static_base_path == data_mount + '/static'
+      - caddy_host_staging_dir == apps_control_state_dir + '/caddy'
+      - podman_user_unit_dir == '/etc/systemd/user'
+    fail_msg: "Caddy paths must use the platform-owned derived locations."
+
+- name: Inspect Caddy control anchors
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ apps_control_state_dir }}"
+    - "{{ podman_quadlet_dir }}"
+    - "{{ podman_user_unit_dir }}"
+  register: caddy_control_anchor_stats
+
+- name: Require safe Caddy control anchors
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not anchor.stat.exists or anchor.stat.isdir
+      - not anchor.stat.exists or not anchor.stat.islnk
+      - not anchor.stat.exists or anchor.stat.uid == 0
+    fail_msg: "A Caddy control anchor is not a safe root-owned directory."
+  loop: "{{ caddy_control_anchor_stats.results }}"
+  loop_control:
+    loop_var: anchor
+    label: "{{ anchor.item }}"
+
+- name: Ensure Caddy control-state anchor
+  ansible.builtin.file:
+    path: "{{ apps_control_state_dir }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0750"
+
+- name: Ensure root-owned runtime source directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ podman_quadlet_dir }}"
+    - "{{ podman_user_unit_dir }}"
+
+- name: Inspect Caddy storage anchors
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ data_mount }}"
+    - "{{ data_mount }}/system"
+    - "{{ data_mount }}/system/ingress"
+    - "{{ data_mount }}/system/ingress/caddy"
+    - "{{ caddy_config_dir }}"
+    - "{{ caddy_config_dir }}/sites-enabled"
+    - "{{ caddy_config_dir }}/snippets"
+    - "{{ caddy_data_dir }}"
+    - "{{ caddy_config_storage_dir }}"
+    - "{{ caddy_log_dir }}"
+  register: caddy_storage_anchor_stats
+
+- name: Require safe Caddy storage anchors
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not anchor.stat.exists or anchor.stat.isdir
+      - not anchor.stat.exists or not anchor.stat.islnk
+    fail_msg: "A Caddy storage anchor is not a safe directory."
+  loop: "{{ caddy_storage_anchor_stats.results }}"
+  loop_control:
+    loop_var: anchor
+    label: "{{ anchor.item }}"
+
+- name: Protect Caddy storage anchors
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ data_mount }}/system"
+    - "{{ data_mount }}/system/ingress"
+    - "{{ data_mount }}/system/ingress/caddy"
+
 - name: Collect Caddy directories
   ansible.builtin.set_fact:
     caddy_directories:
-      - "{{ caddy_config_dir }}"
-      - "{{ caddy_config_dir }}/sites-enabled"
-      - "{{ caddy_config_dir }}/snippets"
-      - "{{ static_base_path }}"
       - "{{ caddy_data_dir }}"
       - "{{ caddy_config_storage_dir }}"
       - "{{ caddy_log_dir }}"
 
 - name: Ensure Caddy directories exist
   ansible.builtin.file:
-    path: "{{ item }}"
+    path: "{{ caddy_directory_state.item }}"
     state: directory
     owner: "{{ podman_user }}"
     group: "{{ podman_group }}"
-    mode: "0755"
-  loop: "{{ caddy_directories }}"
+    mode: "0750"
+  loop: "{{ caddy_storage_anchor_stats.results }}"
   loop_control:
-    label: "{{ item }}"
-  become: true
-  become_user: "{{ podman_user }}"
+    loop_var: caddy_directory_state
+    label: "{{ caddy_directory_state.item }}"
+  when:
+    - caddy_directory_state.item in caddy_directories
+    - not caddy_directory_state.stat.exists
 
-- name: Discover apps and build host data
-  ansible.builtin.include_tasks: ../common/tasks/app_discovery.yml
-  when: host_ingress_networks is not defined
+- name: Inspect active root-owned Quadlet sources
+  ansible.builtin.find:
+    paths: "{{ podman_quadlet_dir }}"
+    file_type: file
+    recurse: true
+    hidden: true
+  register: active_quadlet_sources
 
-- name: Prepare podman user systemd runtime
-  ansible.builtin.include_tasks: ../common/tasks/podman_user_systemd.yml
+- name: Inspect active root-owned Quadlet directories
+  ansible.builtin.find:
+    paths: "{{ podman_quadlet_dir }}"
+    file_type: directory
+    recurse: true
+    hidden: true
+  register: active_quadlet_directories
 
-- name: Seed default snippet placeholder
+- name: Inspect active root-owned Quadlet source links
+  ansible.builtin.find:
+    paths: "{{ podman_quadlet_dir }}"
+    file_type: link
+    recurse: true
+    hidden: true
+  register: active_quadlet_links
+
+- name: Reject linked active Quadlet sources
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - active_quadlet_links.matched == 0
+      - active_quadlet_sources.files | rejectattr('uid', 'equalto', 0) | list | length == 0
+      - active_quadlet_sources.files | rejectattr('mode', 'equalto', '0644') | list | length == 0
+      - active_quadlet_directories.files | rejectattr('uid', 'equalto', 0) | list | length == 0
+      - active_quadlet_directories.files | rejectattr('mode', 'equalto', '0755') | list | length == 0
+    fail_msg: "Active Quadlet sources must be root-owned regular files and directories with protected modes."
+
+- name: Normalize active rootless Quadlet source ownership
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}"
+    state: directory
+    owner: root
+    group: root
+    recurse: true
+  when: >-
+    active_quadlet_sources.files
+    | rejectattr('uid', 'equalto', 0)
+    | list
+    | length > 0
+    or active_quadlet_sources.files
+       | rejectattr('gid', 'equalto', 0)
+       | list
+       | length > 0
+    or active_quadlet_directories.files
+       | rejectattr('gid', 'equalto', 0)
+       | list
+       | length > 0
+
+- name: Set active rootless Quadlet directory permissions
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure protected Caddy Quadlet drop-in directory
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}/caddy.container.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Protect Caddy configuration anchors
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0750"
+  loop:
+    - "{{ caddy_config_dir }}"
+    - "{{ caddy_config_dir }}/sites-enabled"
+    - "{{ caddy_config_dir }}/snippets"
+
+- name: Inspect Caddy staging directory
+  ansible.builtin.stat:
+    path: "{{ caddy_host_staging_dir }}"
+    follow: false
+  register: caddy_staging_directory
+
+- name: Require safe Caddy staging directory
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not caddy_staging_directory.stat.exists or caddy_staging_directory.stat.isdir
+      - not caddy_staging_directory.stat.exists or not caddy_staging_directory.stat.islnk
+      - not caddy_staging_directory.stat.exists or caddy_staging_directory.stat.uid == 0
+    fail_msg: "The Caddy staging path is not a safe root-owned directory."
+
+- name: Ensure protected Caddy staging directory
+  ansible.builtin.file:
+    path: "{{ caddy_host_staging_dir }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0750"
+
+- name: Inspect automation-owned Caddy tree links
+  ansible.builtin.find:
+    paths: "{{ item }}"
+    file_type: link
+    recurse: true
+    hidden: true
+  loop:
+    - "{{ apps_control_state_dir }}"
+    - "{{ caddy_config_dir }}"
+  register: caddy_owned_tree_links
+
+- name: Reject links in automation-owned Caddy trees
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - owned_tree_links.matched == 0
+    fail_msg: "An automation-owned Caddy tree contains unsupported symbolic links."
+  loop: "{{ caddy_owned_tree_links.results }}"
+  loop_control:
+    loop_var: owned_tree_links
+    label: "{{ owned_tree_links.item }}"
+
+- name: Preview shared snippet placeholder
   ansible.builtin.copy:
-    dest: "{{ caddy_config_dir }}/snippets/00-placeholder.caddy"
-    content: |
-      # Default snippet placeholder. Add shared snippets to this directory.
-    owner: "{{ podman_user }}"
+    dest: "{{ caddy_config_dir }}/snippets/00-managed-placeholder.caddy"
+    content: "# Managed shared snippets may be added beside this file.\n"
+    owner: root
     group: "{{ podman_group }}"
     mode: "0644"
     force: false
-  register: snippet_placeholder_result
-  become: true
-  become_user: "{{ podman_user }}"
+  check_mode: true
+  register: caddy_snippet_placeholder_preview
 
-- name: Deploy Caddyfile
-  ansible.builtin.template:
-    src: "Caddyfile.j2"
-    dest: "{{ caddy_config_dir }}/Caddyfile"
-    owner: "{{ podman_user }}"
+- name: Track shared snippet reload requirement
+  ansible.builtin.set_fact:
+    caddy_snippet_requires_reload: "{{ caddy_snippet_placeholder_preview.changed }}"
+
+- name: Persist pending Caddy reload before snippet changes
+  ansible.builtin.file:
+    path: "{{ apps_control_state_dir }}/pending-caddy-global-reload"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+  when: caddy_snippet_requires_reload
+
+- name: Seed shared snippet directory
+  ansible.builtin.copy:
+    dest: "{{ caddy_config_dir }}/snippets/00-managed-placeholder.caddy"
+    content: "# Managed shared snippets may be added beside this file.\n"
+    owner: root
     group: "{{ podman_group }}"
     mode: "0644"
-  register: caddyfile_template
-  become: true
-  become_user: "{{ podman_user }}"
+    force: false
+  register: caddy_snippet_placeholder
 
-- name: Ensure per-app networks exist for Caddy
-  containers.podman.podman_network:
-    name: "{{ item }}"
-    state: present
-  loop: "{{ host_ingress_networks }}"
-  when: host_ingress_networks | length > 0
-  become: true
-  become_user: "{{ podman_user }}"
-
-- name: Deploy Caddy Quadlet file
+- name: Stage global Caddy configuration
   ansible.builtin.template:
-    src: "caddy.container.j2"
-    dest: "/home/{{ podman_user }}/.config/containers/systemd/caddy.container"
-    owner: "{{ podman_user }}"
+    src: Caddyfile.j2
+    dest: "{{ caddy_host_staging_dir }}/Caddyfile"
+    owner: root
     group: "{{ podman_group }}"
+    mode: "0644"
+  register: staged_caddyfile
+
+- name: Preview global Caddy configuration promotion
+  ansible.builtin.copy:
+    src: "{{ caddy_host_staging_dir }}/Caddyfile"
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    remote_src: true
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0644"
+  check_mode: true
+  register: caddyfile_promotion_preview
+
+- name: Track global Caddy reload requirement
+  ansible.builtin.set_fact:
+    caddyfile_requires_reload: "{{ caddyfile_promotion_preview.changed }}"
+
+- name: Inspect active global Caddy configuration
+  ansible.builtin.stat:
+    path: "{{ caddy_config_dir }}/Caddyfile"
+    follow: false
+  register: active_caddyfile_before_promotion
+
+- name: Back up active global Caddy configuration
+  ansible.builtin.copy:
+    src: "{{ caddy_config_dir }}/Caddyfile"
+    dest: "{{ caddy_host_staging_dir }}/Caddyfile.previous"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  when: caddyfile_requires_reload and active_caddyfile_before_promotion.stat.exists
+
+- name: Remove obsolete global Caddy configuration backup
+  ansible.builtin.file:
+    path: "{{ caddy_host_staging_dir }}/Caddyfile.previous"
+    state: absent
+  when: caddyfile_requires_reload and not active_caddyfile_before_promotion.stat.exists
+
+- name: Persist pending Caddy reload before global configuration changes
+  ansible.builtin.file:
+    path: "{{ apps_control_state_dir }}/pending-caddy-global-reload"
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+  when: caddyfile_requires_reload
+
+- name: Inspect pending global Caddy reload marker
+  ansible.builtin.stat:
+    path: "{{ apps_control_state_dir }}/pending-caddy-global-reload"
+    follow: false
+  register: pending_caddy_global_reload_marker
+
+- name: Validate staged global Caddy configuration
+  ansible.builtin.command:
+    argv:
+      - podman
+      - run
+      - --rm
+      - --volume
+      - "{{ caddy_host_staging_dir }}/Caddyfile:/etc/caddy/Caddyfile:ro,Z"
+      - --volume
+      - "{{ caddy_config_dir }}/sites-enabled:/etc/caddy/sites-enabled:ro,Z"
+      - --volume
+      - "{{ caddy_config_dir }}/snippets:/etc/caddy/snippets:ro,Z"
+      - "{{ caddy_image }}"
+      - caddy
+      - validate
+      - --config
+      - /etc/caddy/Caddyfile
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+  when: >-
+    staged_caddyfile.changed
+    or caddy_snippet_placeholder.changed
+    or pending_caddy_global_reload_marker.stat.exists
+
+- name: Promote global Caddy configuration
+  ansible.builtin.copy:
+    src: "{{ caddy_host_staging_dir }}/Caddyfile"
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    remote_src: true
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0644"
+  register: caddyfile_promoted
+
+- name: Recreate Caddy Quadlet candidate directory
+  ansible.builtin.file:
+    path: "{{ caddy_host_staging_dir }}/quadlets"
+    state: absent
+  changed_when: false
+
+- name: Create Caddy Quadlet candidate directory
+  ansible.builtin.file:
+    path: "{{ caddy_host_staging_dir }}/quadlets"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0750"
+  changed_when: false
+
+- name: Copy active Quadlet sources for Caddy validation
+  ansible.builtin.command:
+    argv:
+      - cp
+      - --archive
+      - "{{ podman_quadlet_dir }}/."
+      - "{{ caddy_host_staging_dir }}/quadlets/"
+  changed_when: false
+
+- name: Stage Caddy Quadlet
+  ansible.builtin.template:
+    src: caddy.container.j2
+    dest: "{{ caddy_host_staging_dir }}/quadlets/caddy.container"
+    owner: root
+    group: root
     mode: "0644"
   register: caddy_quadlet_template
+  changed_when: false
+
+- name: Stage Caddy platform network Quadlet
+  ansible.builtin.template:
+    src: caddy-egress.network.j2
+    dest: "{{ caddy_host_staging_dir }}/quadlets/caddy-egress.network"
+    owner: root
+    group: root
+    mode: "0644"
+  register: caddy_platform_network_quadlet
+  changed_when: false
+
+- name: Locate Quadlet generator for Caddy validation
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ caddy_host_quadlet_generator_paths }}"
+  register: caddy_host_quadlet_generators
+
+- name: Require Quadlet generator for Caddy validation
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - caddy_host_quadlet_generators.results | selectattr('stat.exists') | list | length > 0
+    fail_msg: "The Podman Quadlet generator is not installed."
+
+- name: Select Quadlet generator for Caddy validation
+  ansible.builtin.set_fact:
+    caddy_host_quadlet_generator: >-
+      {{ caddy_host_quadlet_generators.results | selectattr('stat.exists') | map(attribute='item') | first }}
+
+- name: Validate staged Caddy Quadlets
+  ansible.builtin.command:
+    argv:
+      - "{{ caddy_host_quadlet_generator }}"
+      - --user
+      - --dryrun
   become: true
   become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env | combine({'QUADLET_UNIT_DIRS': caddy_host_staging_dir ~ '/quadlets'}) }}"
+  changed_when: false
 
-- name: Reload systemd user daemon for podman user
+- name: Stage Caddy pasta service
+  ansible.builtin.template:
+    src: caddy-pasta.service.j2
+    dest: "{{ caddy_host_staging_dir }}/caddy-pasta.service"
+    owner: root
+    group: root
+    mode: "0644"
+  changed_when: false
+
+- name: Inspect active Caddy pasta service
+  ansible.builtin.stat:
+    path: "{{ podman_user_unit_dir }}/caddy-pasta.service"
+    follow: false
+  register: active_caddy_pasta_service
+
+- name: Require safe active Caddy pasta service
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not active_caddy_pasta_service.stat.exists or active_caddy_pasta_service.stat.isreg
+      - not active_caddy_pasta_service.stat.exists or not active_caddy_pasta_service.stat.islnk
+      - not active_caddy_pasta_service.stat.exists or active_caddy_pasta_service.stat.uid == 0
+    fail_msg: "The managed Caddy pasta service destination is unsafe."
+
+- name: Promote Caddy Quadlet
+  ansible.builtin.copy:
+    src: "{{ caddy_host_staging_dir }}/quadlets/caddy.container"
+    dest: "{{ podman_quadlet_dir }}/caddy.container"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: promoted_caddy_quadlet
+
+- name: Promote Caddy platform network Quadlet
+  ansible.builtin.copy:
+    src: "{{ caddy_host_staging_dir }}/quadlets/caddy-egress.network"
+    dest: "{{ podman_quadlet_dir }}/caddy-egress.network"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: promoted_caddy_platform_network
+
+- name: Promote Caddy pasta service
+  ansible.builtin.copy:
+    src: "{{ caddy_host_staging_dir }}/caddy-pasta.service"
+    dest: "{{ podman_user_unit_dir }}/caddy-pasta.service"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: promoted_caddy_pasta_service
+
+# Replacing PublishPort with pasta requires one explicit platform restart to
+# release rootlessport before pasta can bind the same sockets. Routine app
+# deployment still reloads Caddy without restarting it.
+- name: Stop Caddy before activating a changed platform Quadlet
+  ansible.builtin.systemd:
+    name: caddy.service
+    state: stopped
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: promoted_caddy_quadlet.changed
+
+- name: Reload rootless systemd units
   ansible.builtin.systemd:
     daemon_reload: true
     scope: user
@@ -82,14 +525,23 @@
   become_user: "{{ podman_user }}"
   environment: "{{ podman_user_systemd_env }}"
   changed_when: false
+  when: >-
+    promoted_caddy_quadlet.changed
+    or promoted_caddy_platform_network.changed
+    or promoted_caddy_pasta_service.changed
 
-- name: Set Caddy unit name
-  ansible.builtin.set_fact:
-    caddy_unit_name: caddy.service
-
-- name: Enable and start Caddy service
+- name: Ensure Caddy platform network
   ansible.builtin.systemd:
-    name: "{{ caddy_unit_name }}"
+    name: caddy-egress-network.service
+    state: started
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+- name: Enable and start Caddy
+  ansible.builtin.systemd:
+    name: caddy.service
     state: started
     enabled: true
     scope: user
@@ -97,30 +549,89 @@
   become_user: "{{ podman_user }}"
   environment: "{{ podman_user_systemd_env }}"
 
-- name: Track Caddy global config changes
-  ansible.builtin.set_fact:
-    caddy_global_config_changed: >-
-      {{
-        (caddy_global_config_changed | default(false))
-        or (snippet_placeholder_result.changed | default(false))
-        or (caddyfile_template.changed | default(false))
-      }}
-    caddy_service_restart_needed: >-
-      {{
-        (caddy_service_restart_needed | default(false))
-        or (caddy_quadlet_template.changed | default(false))
-      }}
+- name: Ensure Caddy pasta ingress is running
+  ansible.builtin.systemd:
+    name: caddy-pasta.service
+    state: >-
+      {{ 'restarted'
+         if ((promoted_caddy_pasta_service.changed or pasta_launcher.changed | default(false))
+             and not promoted_caddy_quadlet.changed)
+         else 'started' }}
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
 
-- name: Verify Caddy config directory ownership
+- name: Inspect previous global Caddy configuration backup
   ansible.builtin.stat:
-    path: "{{ caddy_config_dir }}"
-  register: caddy_config_dir_stat
+    path: "{{ caddy_host_staging_dir }}/Caddyfile.previous"
+    follow: false
+  register: previous_caddyfile_backup
 
-- name: Assert Caddy config directory owned by podman user
-  ansible.builtin.assert:
-    that:
-      - caddy_config_dir_stat.stat.exists
-      - caddy_config_dir_stat.stat.uid | int != 0
-      - caddy_config_dir_stat.stat.gid | int != 0
-    fail_msg: >-
-      Caddy config dir {{ caddy_config_dir }} must be owned by a non-root user.
+- name: Apply global Caddy configuration
+  when: pending_caddy_global_reload_marker.stat.exists
+  block:
+    - name: Gracefully reload global Caddy configuration
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - caddy
+          - caddy
+          - reload
+          - --address
+          - unix//var/run/caddy.sock
+          - --config
+          - /etc/caddy/Caddyfile
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: true
+
+    - name: Clear applied global Caddy reload marker
+      ansible.builtin.file:
+        path: "{{ apps_control_state_dir }}/pending-caddy-global-reload"
+        state: absent
+
+    - name: Remove previous global Caddy configuration backup
+      ansible.builtin.file:
+        path: "{{ caddy_host_staging_dir }}/Caddyfile.previous"
+        state: absent
+  rescue:
+    - name: Restore previous global Caddy configuration
+      ansible.builtin.copy:
+        src: "{{ caddy_host_staging_dir }}/Caddyfile.previous"
+        dest: "{{ caddy_config_dir }}/Caddyfile"
+        remote_src: true
+        owner: root
+        group: "{{ podman_group }}"
+        mode: "0644"
+      when: previous_caddyfile_backup.stat.exists
+
+    - name: Reload previous global Caddy configuration
+      ansible.builtin.command:
+        argv:
+          - podman
+          - exec
+          - caddy
+          - caddy
+          - reload
+          - --address
+          - unix//var/run/caddy.sock
+          - --config
+          - /etc/caddy/Caddyfile
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: true
+      when: previous_caddyfile_backup.stat.exists
+
+    - name: Fail after global Caddy rollback
+      ansible.builtin.fail:
+        msg: "Caddy rejected the global configuration; the previous file was restored when available."
+
+- name: Track Caddy baseline changes
+  ansible.builtin.set_fact:
+    caddy_unit_name: caddy.service
+    caddy_global_config_changed: false
+    caddy_quadlet_changed: "{{ promoted_caddy_quadlet.changed or promoted_caddy_platform_network.changed }}"

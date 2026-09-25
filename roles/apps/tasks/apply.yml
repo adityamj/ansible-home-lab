@@ -1,0 +1,373 @@
+---
+# Retire obsolete writers and activation sources before promoting replacements.
+- name: Compute stale app resources for garbage collection
+  ansible.builtin.set_fact:
+    stale_services: >-
+      {{ (previous_host_state.all_host_services | default([]))
+         | difference(app_apply_plan.all_host_services | default([]))
+         if not deployment_is_targeted else [] }}
+    stale_containers: >-
+      {{ (previous_host_state.all_host_containers | default([]))
+         | difference(app_apply_plan.all_host_containers | default([]))
+         if not deployment_is_targeted else [] }}
+    stale_networks: >-
+      {{ (previous_host_state.all_host_networks | default([]))
+         | difference(app_apply_plan.all_host_networks | default([]))
+         if not deployment_is_targeted else [] }}
+    stale_quadlets: >-
+      {{ (previous_host_state.quadlets | default([]))
+         | difference(app_apply_plan.quadlets | default([]))
+         if not deployment_is_targeted else [] }}
+    stale_units: >-
+      {{ (previous_host_state.all_host_units | default([]))
+         | difference(app_apply_plan.all_host_units | default([]))
+         if not deployment_is_targeted else [] }}
+    stale_caddy_sites: >-
+      {{ (previous_host_state.caddy_sites | default([]))
+         | difference(app_apply_plan.caddy_sites | default([]))
+         if not deployment_is_targeted else [] }}
+
+- name: Stop stale services
+  ansible.builtin.command:
+    argv: [systemctl, --user, stop, "{{ service_name }}"]
+  register: stale_service_stop
+  changed_when: stale_service_stop.rc == 0
+  failed_when: >-
+    stale_service_stop.rc != 0
+    and 'not loaded' not in stale_service_stop.stderr | lower
+    and 'could not be found' not in stale_service_stop.stderr | lower
+  loop: "{{ stale_services }}"
+  loop_control:
+    loop_var: service_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: not deployment_is_targeted
+
+- name: Remove stale Quadlet activation sources before runtime cleanup
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}/{{ quadlet_file }}"
+    state: absent
+  loop: "{{ stale_quadlets }}"
+  loop_control:
+    loop_var: quadlet_file
+  when: not deployment_is_targeted
+
+- name: Remove stale pasta unit sources before runtime cleanup
+  ansible.builtin.file:
+    path: "{{ podman_user_unit_dir }}/{{ unit_file }}"
+    state: absent
+  loop: "{{ stale_units }}"
+  loop_control:
+    loop_var: unit_file
+  when: not deployment_is_targeted
+
+- name: Reload systemd before removing stale runtime resources
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: not deployment_is_targeted and (stale_quadlets | length > 0 or stale_units | length > 0)
+
+- name: Remove obsolete application masks after retiring activation sources
+  ansible.builtin.systemd:
+    name: "{{ service_name }}"
+    masked: false
+    scope: user
+  loop: "{{ stale_services }}"
+  loop_control:
+    loop_var: service_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: not deployment_is_targeted
+
+- name: Remove stale containers
+  ansible.builtin.command:
+    argv:
+      - podman
+      - rm
+      - --force
+      - "{{ container_name }}"
+  loop: "{{ stale_containers }}"
+  loop_control:
+    loop_var: container_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: removed_stale_containers
+  changed_when: removed_stale_containers.rc == 0
+  failed_when: removed_stale_containers.rc != 0 and 'no such container' not in removed_stale_containers.stderr | lower
+  when: not deployment_is_targeted
+
+- name: Promote rendered Quadlet files
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/quadlets/{{ quadlet_file }}"
+    dest: "{{ podman_quadlet_dir }}/{{ quadlet_file }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ app_apply_plan.quadlets }}"
+  loop_control:
+    loop_var: quadlet_file
+    label: "{{ quadlet_file }}"
+  register: promoted_quadlet_files
+
+- name: Promote rendered pasta service units
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/units/{{ unit_file }}"
+    dest: "{{ podman_user_unit_dir }}/{{ unit_file }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ app_apply_plan.units }}"
+  loop_control:
+    loop_var: unit_file
+    label: "{{ unit_file }}"
+  register: promoted_pasta_units
+
+- name: Promote rendered Caddy sites
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/caddy/sites-enabled/{{ site_file }}"
+    dest: "{{ caddy_config_dir }}/sites-enabled/{{ site_file }}"
+    remote_src: true
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "0644"
+  loop: "{{ app_apply_plan.caddy_sites }}"
+  loop_control:
+    loop_var: site_file
+    label: "{{ site_file }}"
+  register: promoted_caddy_sites
+
+- name: Collect services whose container Quadlet changed
+  ansible.builtin.set_fact:
+    changed_quadlet_services: >-
+      {%- set services = [] -%}
+      {%- for result in promoted_quadlet_files.results | default([])
+             if result.changed | default(false) and result.quadlet_file | default('') is match('.*\\.container$') -%}
+      {%-   set _ = services.append(result.quadlet_file | regex_replace('\\.container$', '.service')) -%}
+      {%- endfor -%}
+      {{ services | sort }}
+
+- name: Collect services whose pasta unit changed
+  ansible.builtin.set_fact:
+    changed_pasta_services: >-
+      {%- set services = [] -%}
+      {%- for result in promoted_pasta_units.results | default([]) if result.changed | default(false) -%}
+      {%-   set _ = services.append(result.unit_file) -%}
+      {%- endfor -%}
+      {{ services | sort }}
+
+- name: Track broad application restart requirement
+  ansible.builtin.set_fact:
+    all_selected_services_need_restart: >-
+      {{ force_refresh or app_secrets_changed
+         or managed_config_dirs_changed | default(false)
+         or (copied_managed_config_files.results | default([]) | selectattr('changed') | list | length > 0) }}
+
+- name: Reload rootless systemd after Quadlet promotion
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+  when: >-
+    force_refresh
+    or promoted_quadlet_files.results | default([]) | selectattr('changed') | list | length > 0
+    or promoted_pasta_units.results | default([]) | selectattr('changed') | list | length > 0
+    or stale_quadlets | length > 0
+    or stale_units | length > 0
+
+- name: Ensure selected application networks are started
+  ansible.builtin.systemd:
+    name: "{{ network_service }}"
+    state: started
+    scope: user
+  loop: "{{ app_apply_plan.network_services }}"
+  loop_control:
+    loop_var: network_service
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+# The systemd module unmasks before performing its state operation.
+- name: Unmask and start or restart selected running application services
+  ansible.builtin.systemd:
+    name: "{{ service_name }}"
+    masked: false
+    state: "{{ 'restarted' if app_runtime_changed else 'started' }}"
+    scope: user
+  loop: "{{ app_apply_plan.running_services }}"
+  loop_control:
+    loop_var: service_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  vars:
+    app_runtime_changed: >-
+      {{ all_selected_services_need_restart
+         or service_name in changed_quadlet_services
+         or service_name in changed_pasta_services }}
+
+- name: Recover Caddy ingress before runtime reconciliation
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/ensure_caddy_running.yml"
+
+- name: Observe container runtime and wait for selected applications
+  containers.podman.podman_container_info: {}
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: host_container_runtime
+  changed_when: false
+  until: >-
+    {%- set selected = host_container_runtime.containers | default([])
+       | selectattr('Name', 'in', app_apply_plan.running_containers) | list -%}
+    {%- set readiness = namespace(ok=selected | length == app_apply_plan.running_containers | length) -%}
+    {%- for container in selected -%}
+    {%- if not container.State.Running | default(false)
+       or container.State.Health.Status | default('healthy') != 'healthy' -%}
+    {%- set readiness.ok = false -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {{ readiness.ok }}
+  retries: 30
+  delay: 2
+
+- name: Verify inactive containers remained stopped after network activation
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not item.State.Running | default(false)
+    fail_msg: "Inactive container {{ item.Name }} unexpectedly started. Review external activation sources."
+  loop: >-
+    {{ host_container_runtime.containers | default([])
+       | selectattr('Name', 'in', app_apply_plan.inactive_containers) | list }}
+  loop_control:
+    label: "{{ item.Name }}"
+
+- name: Select ingress from shared runtime observation
+  ansible.builtin.set_fact:
+    caddy_runtime_info:
+      containers: "{{ host_container_runtime.containers | selectattr('Name', 'equalto', 'caddy') | list }}"
+
+- name: Require running Caddy container
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - caddy_runtime_info.containers | default([]) | length == 1
+      - caddy_runtime_info.containers[0].State.Running | default(false)
+    fail_msg: "Caddy must be running before application network reconciliation."
+
+- name: Collect Caddy networks to attach
+  ansible.builtin.set_fact:
+    caddy_networks_to_attach: >-
+      {{ app_apply_plan.caddy_networks
+         | difference(caddy_runtime_info.containers[0].NetworkSettings.Networks | default({}) | dict2items | map(attribute='key') | list) }}
+
+- name: Attach Caddy to selected ingress networks
+  ansible.builtin.command:
+    argv:
+      - podman
+      - network
+      - connect
+      - "{{ caddy_network }}"
+      - caddy
+  loop: "{{ caddy_networks_to_attach }}"
+  loop_control:
+    loop_var: caddy_network
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: caddy_network_attach_results
+  changed_when: caddy_network_attach_results.rc == 0
+  failed_when: >-
+    caddy_network_attach_results.rc != 0
+    and 'already connected' not in caddy_network_attach_results.stderr | lower
+
+- name: Remove stale Caddy sites
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}/sites-enabled/{{ site_file }}"
+    state: absent
+  loop: "{{ stale_caddy_sites }}"
+  loop_control:
+    loop_var: site_file
+  register: removed_stale_caddy_sites
+  when: not deployment_is_targeted
+
+- name: Reload Caddy after site changes
+  ansible.builtin.command:
+    argv:
+      - podman
+      - exec
+      - caddy
+      - caddy
+      - reload
+      - --address
+      - unix//var/run/caddy.sock
+      - --config
+      - /etc/caddy/Caddyfile
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+  when: >-
+    force_refresh
+    or promoted_caddy_sites.results | default([]) | selectattr('changed') | list | length > 0
+    or removed_stale_caddy_sites.results | default([]) | selectattr('changed') | list | length > 0
+
+- name: Disconnect Caddy from selected inactive application networks
+  ansible.builtin.command:
+    argv: [podman, network, disconnect, "{{ item }}", caddy]
+  loop: >-
+    {{ app_apply_plan.inactive_caddy_networks
+       | intersect((caddy_runtime_info.containers[0].NetworkSettings.Networks | default({}, true)).keys() | list) }}
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+
+- name: Disconnect Caddy from stale networks
+  ansible.builtin.command:
+    argv:
+      - podman
+      - network
+      - disconnect
+      - "{{ network_name }}"
+      - caddy
+  loop: "{{ stale_networks }}"
+  loop_control:
+    loop_var: network_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: disconnected_stale_caddy_networks
+  changed_when: disconnected_stale_caddy_networks.rc == 0
+  failed_when: >-
+    disconnected_stale_caddy_networks.rc != 0
+    and 'not connected' not in disconnected_stale_caddy_networks.stderr | lower
+    and 'no such network' not in disconnected_stale_caddy_networks.stderr | lower
+  when: not deployment_is_targeted
+
+- name: Remove stale networks
+  ansible.builtin.command:
+    argv:
+      - podman
+      - network
+      - rm
+      - "{{ network_name }}"
+  loop: "{{ stale_networks }}"
+  loop_control:
+    loop_var: network_name
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: removed_stale_networks
+  changed_when: removed_stale_networks.rc == 0
+  failed_when: removed_stale_networks.rc != 0 and 'no such network' not in removed_stale_networks.stderr | lower
+  when: not deployment_is_targeted

@@ -1,12 +1,9 @@
 {
+{% if caddy_admin_email | default('') | trim | length > 0 %}
     email {{ caddy_admin_email }}
-
-    # Admin API enabled (required for reload)
+{% endif %}
     admin unix//var/run/caddy.sock
 }
 
-# Shared snippets (no site blocks here)
 import snippets/*.caddy
-
-# Sites enabled configs
 import sites-enabled/*.caddy

@@ -1,0 +1,121 @@
+#!/bin/sh
+# Attach pasta to the network namespace of a running Podman container.
+# Usage: pasta-for-container CONTAINER [PASTA_ARGUMENT ...]
+set -eu
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: ${0##*/} CONTAINER [PASTA_ARGUMENT ...]" >&2
+    exit 64
+fi
+
+container=$1
+shift
+
+pid=$(/usr/bin/podman container inspect --format '{{.State.Pid}}' "$container")
+case "$pid" in
+    ''|*[!0-9]*|0)
+        echo "${0##*/}: container '$container' is not running" >&2
+        exit 1
+        ;;
+esac
+
+if [ ! -e "/proc/$pid/ns/net" ]; then
+    echo "${0##*/}: network namespace for container '$container' is unavailable" >&2
+    exit 1
+fi
+
+# A companion pasta interface must not replace the container's existing bridge
+# interfaces. Discover its caller-selected name while leaving every argument
+# unchanged for pasta.
+pasta_interface=
+expect_interface=false
+for argument in "$@"; do
+    if [ "$expect_interface" = true ]; then
+        pasta_interface=$argument
+        expect_interface=false
+        continue
+    fi
+    case "$argument" in
+        --ns-ifname)
+            expect_interface=true
+            ;;
+        --ns-ifname=*)
+            pasta_interface=${argument#*=}
+            ;;
+    esac
+done
+if [ "$expect_interface" = true ] || [ -z "$pasta_interface" ]; then
+    echo "${0##*/}: pasta arguments must include --ns-ifname INTERFACE" >&2
+    exit 64
+fi
+
+namespace_exec() {
+    /usr/bin/podman unshare /usr/bin/nsenter --target "$pid" --net -- "$@"
+}
+
+cleanup_routes() {
+    namespace_exec /usr/sbin/ip -4 rule del priority 10000 >/dev/null 2>&1 || true
+    namespace_exec /usr/sbin/ip -4 route flush table 100 >/dev/null 2>&1 || true
+    namespace_exec /usr/sbin/ip -6 rule del priority 10000 >/dev/null 2>&1 || true
+    namespace_exec /usr/sbin/ip -6 route flush table 101 >/dev/null 2>&1 || true
+}
+
+configure_routes() {
+    v4_address=$(namespace_exec /usr/sbin/ip -o -4 address show dev "$pasta_interface" scope global | awk 'NR == 1 { sub(/\/.*/, "", $4); print $4 }')
+    v4_gateway=$(namespace_exec /usr/sbin/ip -4 route show default dev "$pasta_interface" | awk 'NR == 1 { print $3 }')
+    v6_address=$(namespace_exec /usr/sbin/ip -o -6 address show dev "$pasta_interface" scope global | awk 'NR == 1 { sub(/\/.*/, "", $4); print $4 }')
+    v6_gateway=$(namespace_exec /usr/sbin/ip -6 route show default dev "$pasta_interface" | awk 'NR == 1 { print $3 }')
+
+    cleanup_routes
+    configured=false
+    if [ -n "$v4_address" ] && [ -n "$v4_gateway" ]; then
+        namespace_exec /usr/sbin/ip -4 route replace table 100 default via "$v4_gateway" dev "$pasta_interface" onlink
+        namespace_exec /usr/sbin/ip -4 rule add priority 10000 from "$v4_address/32" table 100
+        configured=true
+    fi
+    if [ -n "$v6_address" ] && [ -n "$v6_gateway" ]; then
+        namespace_exec /usr/sbin/ip -6 route replace table 101 default via "$v6_gateway" dev "$pasta_interface" onlink
+        namespace_exec /usr/sbin/ip -6 rule add priority 10000 from "$v6_address/128" table 101
+        configured=true
+    fi
+    [ "$configured" = true ]
+}
+
+# Pasta must remain in the foreground. Run it as the supervised child so this
+# wrapper can install symmetric source-policy routes after pasta0 appears.
+/usr/bin/pasta "$@" "$pid" &
+pasta_pid=$!
+terminate() {
+    kill -TERM "$pasta_pid" >/dev/null 2>&1 || true
+}
+trap terminate HUP INT TERM
+
+configured=false
+attempt=0
+while [ "$attempt" -lt 200 ]; do
+    if ! kill -0 "$pasta_pid" >/dev/null 2>&1; then
+        wait "$pasta_pid"
+        exit $?
+    fi
+    if namespace_exec /usr/sbin/ip link show dev "$pasta_interface" >/dev/null 2>&1 && configure_routes; then
+        configured=true
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.05
+done
+
+if [ "$configured" != true ]; then
+    echo "${0##*/}: failed to configure policy routing for '$pasta_interface'" >&2
+    terminate
+    wait "$pasta_pid" || true
+    cleanup_routes
+    exit 1
+fi
+
+set +e
+wait "$pasta_pid"
+status=$?
+set -e
+cleanup_routes
+exit "$status"

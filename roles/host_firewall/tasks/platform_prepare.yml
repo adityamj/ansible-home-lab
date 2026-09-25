@@ -1,0 +1,17 @@
+---
+- name: Install authoritative nftables boot entry point
+  ansible.builtin.template:
+    src: nftables-entrypoint.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: '0644'
+    validate: /usr/sbin/nft --check --file %s
+
+# The distribution service owns boot ordering and reload. Do not restart it:
+# its ExecStop may flush rules. Live updates use one atomic nft transaction.
+- name: Enable standard nftables service
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started

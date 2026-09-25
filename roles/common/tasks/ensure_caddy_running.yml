@@ -1,0 +1,34 @@
+---
+# Execute through runuser from the play's root context. A second Ansible sudo
+# transition to the rootless account can prompt or time out on hardened hosts.
+- name: Clear prior Caddy service failure state
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - --user
+      - "{{ podman_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ podman_uid }}"
+      - "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ podman_uid }}/bus"
+      - systemctl
+      - --user
+      - reset-failed
+      - caddy.service
+  changed_when: false
+
+- name: Start Caddy ingress
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - --user
+      - "{{ podman_user }}"
+      - --
+      - env
+      - "XDG_RUNTIME_DIR=/run/user/{{ podman_uid }}"
+      - "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ podman_uid }}/bus"
+      - systemctl
+      - --user
+      - start
+      - caddy.service
+  changed_when: false

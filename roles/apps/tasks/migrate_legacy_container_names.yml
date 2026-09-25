@@ -1,0 +1,123 @@
+---
+# One-time compatibility bridge for hosts deployed before stable physical names.
+#
+# Legacy deployments used these rootless unit/container names:
+#   <app>-<container>.service
+#   <app>-<container>
+# Current deployments use compiler-emitted container.service_name and
+# container.physical_name.  Data paths are intentionally not touched here.
+
+- name: Require explicit migration records
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - legacy_container_name_migrations is defined
+      - migration_legacy_container_sources is defined
+
+- name: Inspect legacy rootless Quadlet sources
+  ansible.builtin.stat:
+    path: "{{ source_path }}"
+    follow: false
+  loop: "{{ migration_legacy_container_sources }}"
+  loop_control:
+    loop_var: source_path
+  register: legacy_quadlet_source_stats
+
+- name: Require safe legacy rootless Quadlet sources
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not legacy_source.stat.exists or legacy_source.stat.isreg
+      - not legacy_source.stat.exists or not legacy_source.stat.islnk
+      - legacy_source.source_path | dirname == podman_quadlet_dir
+      - not legacy_source.stat.exists or legacy_source.stat.uid == 0
+      - not legacy_source.stat.exists or legacy_source.stat.gid == 0
+      - not legacy_source.stat.exists or legacy_source.stat.mode in ['0600', '0640', '0644']
+    fail_msg: "A legacy rootless Quadlet source is unsafe; remove it manually."
+  loop: "{{ legacy_quadlet_source_stats.results | default([]) }}"
+  loop_control:
+    loop_var: legacy_source
+    label: "{{ legacy_source.source_path }}"
+
+- name: Stop legacy container services
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - --user
+      - stop
+      - "{{ migration.legacy_service }}"
+  loop: "{{ legacy_container_name_migrations }}"
+  loop_control:
+    loop_var: migration
+    label: "{{ migration.legacy_service }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: stopped_legacy_container_services
+  changed_when: stopped_legacy_container_services.rc == 0
+  failed_when: >-
+    stopped_legacy_container_services.rc != 0
+    and 'not loaded' not in stopped_legacy_container_services.stderr | lower
+    and 'could not be found' not in stopped_legacy_container_services.stderr | lower
+
+# Quadlet services are generated units: systemctl disable is not supported.
+# Removing the legacy source and reloading the generator below removes their
+# generated WantedBy links, preventing activation on subsequent boots.
+
+- name: Verify legacy container services are inactive
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - --user
+      - is-active
+      - "{{ migration.legacy_service }}"
+  loop: "{{ legacy_container_name_migrations }}"
+  loop_control:
+    loop_var: migration
+    label: "{{ migration.legacy_service }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: legacy_container_service_status
+  changed_when: false
+  failed_when: legacy_container_service_status.rc not in [3, 4]
+
+- name: Remove legacy containers after service stop
+  ansible.builtin.command:
+    argv:
+      - podman
+      - rm
+      - --force
+      - "{{ migration.legacy_container }}"
+  loop: "{{ legacy_container_name_migrations }}"
+  loop_control:
+    loop_var: migration
+    label: "{{ migration.legacy_container }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: removed_legacy_containers
+  changed_when: removed_legacy_containers.rc == 0
+  failed_when: >-
+    removed_legacy_containers.rc != 0
+    and 'no such container' not in removed_legacy_containers.stderr | lower
+
+# Unsupported source locations were rejected before cutover.
+- name: Remove administrator-owned legacy Quadlet sources
+  ansible.builtin.file:
+    path: "{{ source_path }}"
+    state: absent
+  loop: "{{ migration_legacy_container_sources }}"
+  loop_control:
+    loop_var: source_path
+  register: removed_legacy_quadlet_sources
+
+- name: Reload rootless systemd after legacy Quadlet cleanup
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+  when: removed_legacy_quadlet_sources.results | default([]) | selectattr('changed') | list | length > 0

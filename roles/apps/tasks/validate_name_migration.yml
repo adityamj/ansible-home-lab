@@ -1,0 +1,212 @@
+---
+# This is deliberately stricter than deployment. The current catalog is not an
+# ownership record for old names: discover what exists before stopping anything.
+- name: Collect supported migration source paths
+  ansible.builtin.set_fact:
+    migration_allowed_sources: >-
+      {%- set paths = [podman_quadlet_dir ~ '/caddy.container', podman_quadlet_dir ~ '/caddy-egress.network']
+         + migration_legacy_container_sources + migration_legacy_network_sources -%}
+      {%- for application in migration_plan.host_apps -%}
+      {%- for resource in application.containers + (application.networks | default([])) -%}
+      {%- set _ = paths.append(podman_quadlet_dir ~ '/' ~ resource.quadlet_name) -%}
+      {%- endfor -%}
+      {%- set _ = paths.append(podman_quadlet_dir ~ '/caddy.container.d/50-network-' ~ application.name ~ '.conf') -%}
+      {%- endfor -%}
+      {{ paths }}
+
+- name: Inventory all rootless containers including stopped containers
+  containers.podman.podman_container_info:
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_existing_containers
+
+- name: Reject containers not explained by the migration catalog
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - unexplained_containers | length == 0
+    fail_msg: >-
+      Unexplained containers {{ unexplained_containers }}. Restore the deployed
+      catalog or provide a reviewed manual migration; an untracked legacy writer
+      must not survive replacement startup.
+  vars:
+    unexplained_containers: >-
+      {{ migration_existing_containers.containers | map(attribute='Name') | list
+         | difference(migration_legacy_names + migration_plan.host_container_resource_names + ['caddy']) }}
+
+- name: Inventory applicable Quadlet source locations
+  loop_control:
+    label: "{{ item.path }}"
+  ansible.builtin.find:
+    paths: "{{ item.path }}"
+    recurse: "{{ item.recurse }}"
+    hidden: true
+    file_type: any
+    patterns: ['*.container', '*.network', '*.volume', '*.kube', '*.pod', '*.build', '*.image', '*.artifact', '*.conf']
+  loop:
+    - {path: "{{ podman_home }}/.config/containers/systemd", recurse: true}
+    - {path: "{{ podman_quadlet_dir }}", recurse: true}
+    - {path: "{{ podman_user_systemd_env.XDG_RUNTIME_DIR }}/containers/systemd", recurse: true}
+    - {path: /etc/containers/systemd/users, recurse: false}
+    - {path: /usr/share/containers/systemd/users, recurse: false}
+    - {path: "/usr/share/containers/systemd/users/{{ podman_uid }}", recurse: true}
+  register: migration_source_inventory
+
+- name: Reject unknown or indirect Quadlet sources before cutover
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.path in migration_allowed_sources
+      - item.isreg | default(false)
+      - item.uid == 0
+      - item.gid == 0
+      - item.mode in ['0600', '0640', '0644']
+    fail_msg: >-
+      Unsupported Quadlet source {{ item.path }}. This migration accepts only
+      catalog-matched, root-owned sources under {{ podman_quadlet_dir }}.
+      User-directory sources are unsupported even if owned by root. Review
+      unknown sources manually before retrying.
+  loop: "{{ migration_source_inventory.results | map(attribute='files') | flatten }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Read legacy network source mappings before cutover
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: >-
+    {{ migration_source_inventory.results | map(attribute='files') | flatten
+       | selectattr('path', 'in', migration_legacy_network_sources) | list }}
+  register: migration_legacy_network_contents
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Require exact legacy network filename and runtime name mapping
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - executable_lines == ['[Network]', 'NetworkName=' ~ expected_network_name]
+      - expected_network_name in migration_legacy_networks
+    fail_msg: >-
+      Unsupported legacy network configuration {{ item.item.path }}. Expected
+      only [Network] and NetworkName={{ expected_network_name }}. Review custom
+      network mappings/options manually before migration.
+  vars:
+    expected_network_name: "{{ item.item.path | basename | regex_replace('[.]network$', '-net') }}"
+    executable_lines: >-
+      {{ (item.content | b64decode).splitlines() | map('trim')
+         | reject('match', '^(#|;|$)') | list }}
+  loop: "{{ migration_legacy_network_contents.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Read legacy container source directives before masking
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: >-
+    {{ migration_source_inventory.results | map(attribute='files') | flatten
+       | selectattr('path', 'in', migration_legacy_container_sources) | list }}
+  register: migration_legacy_source_contents
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Require conventional legacy container and service names
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - source_text | regex_findall('(?m)^\s*ContainerName\s*=\s*(.*?)\s*$') == [item.item.path | basename | regex_replace('[.]container$', '')]
+      - source_text | regex_findall('(?mi)^\s*ServiceName\s*=') | length == 0
+    fail_msg: "Legacy naming overrides require manual review: {{ item.item.path }}"
+  vars:
+    source_text: "{{ item.content | b64decode }}"
+  loop: "{{ migration_legacy_source_contents.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Inventory user service files and overrides
+  ansible.builtin.find:
+    paths: "{{ podman_home }}/.config/systemd/user"
+    recurse: true
+    hidden: true
+    file_type: any
+    patterns: ['*.service', '*.conf']
+  register: migration_user_units
+
+- name: Inspect persistent user activation links without following them
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  loop: "{{ migration_user_units.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+  register: migration_user_unit_stats
+
+# Generated WantedBy links live under /run, not in this directory. Only masks
+# created by an earlier attempt are supported here; hand-written units or enable
+# links may be alternate activation sources and require an explicit review.
+- name: Reject alternate persistent user activation sources
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stat.islnk | default(false)
+      - item.stat.lnk_source | default('') == '/dev/null'
+      - item.item.path == podman_home ~ '/.config/systemd/user/' ~ (item.item.path | basename)
+      - >-
+        item.item.path | basename in
+        ((migration_legacy_names | map('regex_replace', '$', '.service') | list)
+         + (migration_plan.host_apps | map(attribute='containers') | flatten | map(attribute='service_name') | list))
+    fail_msg: "Unsupported persistent user activation source: {{ item.item.path }}"
+  loop: "{{ migration_user_unit_stats.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Require canonical Caddy source and drop-in paths
+  ansible.builtin.command:
+    argv: [realpath, -m, "{{ item }}"]
+  loop:
+    - "{{ podman_quadlet_dir }}/caddy.container"
+    - "{{ podman_quadlet_dir }}/caddy.container.d"
+  register: migration_caddy_path
+  changed_when: false
+  failed_when: migration_caddy_path.rc != 0 or migration_caddy_path.stdout != item
+
+- name: Read prepared Caddy baseline
+  ansible.builtin.slurp:
+    src: "{{ podman_quadlet_dir }}/caddy.container"
+  register: migration_caddy_source
+
+- name: Require platform-owned Caddy network configuration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - source_text | regex_findall('(?m)^\s*Network\s*=\s*(.*?)\s*$') == ['caddy-egress.network']
+      - "'ExecCondition=/usr/local/libexec/ansible-storage-ready' in source_text"
+    fail_msg: >-
+      Prepare the current Caddy baseline before migration. Its base Quadlet must
+      not retain legacy application networks; application membership uses drop-ins.
+  vars:
+    source_text: "{{ migration_caddy_source.content | b64decode }}"
+
+- name: Validate legacy or stable app-owned Caddy network drop-ins
+  ansible.builtin.include_tasks: validate_caddy_migration_dropins.yml
+  vars:
+    migration_allow_legacy_caddy_networks: true
+
+- name: Reject effective Caddy service overrides
+  ansible.builtin.command:
+    argv: [systemctl, --user, show, caddy.service, --property=DropInPaths, --value]
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_caddy_service_overrides
+  changed_when: false
+  failed_when: migration_caddy_service_overrides.rc != 0 or migration_caddy_service_overrides.stdout | trim != ''
+
+- name: Inspect effective Caddy activation source
+  ansible.builtin.command:
+    argv: [systemctl, --user, show, caddy.service, --property=SourcePath, --value]
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_caddy_effective_source
+  changed_when: false
+  failed_when: >-
+    migration_caddy_effective_source.rc != 0
+    or migration_caddy_effective_source.stdout | trim != podman_quadlet_dir ~ '/caddy.container'

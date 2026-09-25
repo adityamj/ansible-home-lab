@@ -1,0 +1,25 @@
+---
+- name: Ensure private migration record directory
+  ansible.builtin.file:
+    path: "{{ migration_state_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Merge conservative migration state
+  ansible.builtin.set_fact:
+    migration_record: "{{ migration_identity | combine(migration_record) | combine(migration_update) }}"
+
+- name: Persist migration state atomically
+  ansible.builtin.copy:
+    dest: "{{ migration_state_path }}"
+    content: "{{ migration_record | to_nice_json }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Flush migration record before crossing a safety barrier
+  ansible.builtin.command:
+    argv: [sync, '-f', "{{ migration_state_path }}"]
+  changed_when: false

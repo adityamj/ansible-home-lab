@@ -1,0 +1,58 @@
+---
+- name: Inspect running source migration containers
+  ansible.builtin.command:
+    argv: [podman, container, inspect, "{{ item.physical_name }}"]
+  loop: "{{ migration_model.containers }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_source_containers
+  changed_when: false
+  when: migration_record.image_digests is not defined
+
+- name: Require every source migration container to be running
+  ansible.builtin.assert:
+    that:
+      - (item.stdout | from_json | first).State.Running | bool
+  loop: "{{ migration_source_containers.results }}"
+  loop_control:
+    label: "{{ item.item.physical_name }}"
+  when: migration_record.image_digests is not defined
+
+- name: Inspect immutable source image identities
+  ansible.builtin.command:
+    argv: [podman, image, inspect, "{{ (item.stdout | from_json | first).Image }}"]
+  loop: "{{ migration_source_containers.results }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_source_images
+  changed_when: false
+  loop_control:
+    label: "{{ item.item.item.image }}"
+  when: migration_record.image_digests is not defined
+
+- name: Initialize resolved migration image map from durable state
+  ansible.builtin.set_fact:
+    migration_resolved_images: "{{ migration_record.image_digests | default({}) }}"
+
+- name: Resolve source images to matching repository digests
+  ansible.builtin.set_fact:
+    migration_resolved_images: "{{ migration_resolved_images | combine({item.item.item.image: matching_digests | first}) }}"
+  vars:
+    declared_repository: "{{ item.item.item.image | regex_replace('@sha256:[0-9a-f]{64}$', '') | regex_replace(':[^/:]+$', '') }}"
+    matching_digests: >-
+      {{ (item.stdout | from_json | first).RepoDigests | default([])
+         | select('match', '^' ~ (declared_repository | regex_escape) ~ '@sha256:[0-9a-f]{64}$')
+         | unique | sort | list }}
+  loop: "{{ migration_source_images.results }}"
+  loop_control:
+    label: "{{ item.item.item.image }}"
+  failed_when: matching_digests | length == 0
+  when: migration_record.image_digests is not defined
+
+- name: Require one immutable digest per declared source image
+  ansible.builtin.assert:
+    that:
+      - migration_resolved_images | length == migration_model.containers | map(attribute='image') | unique | length
+    fail_msg: "A running source image has no unique digest for its declared repository; do not substitute a different image."

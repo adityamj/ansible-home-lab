@@ -1,0 +1,153 @@
+---
+# One-off transition. Preserve deployed allowances rather than compiling today's
+# app catalog, which may describe services that have not yet been deployed.
+- name: Require a real host-wide firewall migration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not ansible_check_mode
+      - app | default('') | string | trim | length == 0
+      - target_app | default('') | string | trim | length == 0
+    fail_msg: "Use --limit to select hosts. Targeted migration and check mode are unsupported."
+
+- name: Reject independent legacy iptables policy before migration
+  ansible.builtin.include_tasks: check_legacy_backend.yml
+
+- name: Require canonical firewall configuration directory
+  ansible.builtin.command:
+    argv: [realpath, -e, /etc/nftables.d]
+  register: migration_firewall_directory
+  changed_when: false
+  failed_when: migration_firewall_directory.stdout != '/etc/nftables.d'
+
+- name: Inspect existing firewall policy and entry point
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /etc/nftables.d/ansible-host-filter.nft
+    - /etc/nftables.conf
+  register: migration_firewall_files
+
+- name: Require safe existing firewall configuration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stat.isreg | default(false)
+      - not item.stat.islnk | default(false)
+      - item.stat.uid | default(-1) == 0
+    fail_msg: "Firewall migration requires existing root-owned, regular policy and entry-point files."
+  loop: "{{ migration_firewall_files.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Read existing managed firewall policy
+  ansible.builtin.slurp:
+    src: /etc/nftables.d/ansible-host-filter.nft
+  register: migration_firewall_source
+
+- name: Decode existing firewall policy
+  ansible.builtin.set_fact:
+    migration_firewall_policy: "{{ migration_firewall_source.content | b64decode }}"
+
+- name: Validate complete supported policy and SSH allowance on controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../tools/validate_firewall_migration.py"
+    stdin: "{{ {'policy': migration_firewall_policy, 'ssh_port': ssh_port} | to_json }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: migration_validated_policy
+
+- name: Record validated deployed allowances
+  ansible.builtin.set_fact:
+    migration_preserved_ports: "{{ (migration_validated_policy.stdout | from_json).ports }}"
+
+- name: Inspect complete pre-migration live ruleset
+  ansible.builtin.command:
+    argv: [/usr/sbin/nft, list, ruleset]
+  register: migration_firewall_live
+  changed_when: false
+
+- name: Create private migration backup directory
+  ansible.builtin.file:
+    path: /var/lib/ansible-app-host/firewall-migration-backup
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Preserve original configuration backups without overwriting on retry
+  loop_control:
+    label: "{{ item.name }}"
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "/var/lib/ansible-app-host/firewall-migration-backup/{{ item.name }}"
+    remote_src: true
+    force: false
+    owner: root
+    group: root
+    mode: '0600'
+  loop:
+    - src: /etc/nftables.d/ansible-host-filter.nft
+      name: managed-policy.nft
+    - src: /etc/nftables.conf
+      name: nftables.conf
+
+- name: Preserve original live ruleset for explicit operator recovery
+  ansible.builtin.copy:
+    content: "flush ruleset\n{{ migration_firewall_live.stdout }}\n"
+    dest: /var/lib/ansible-app-host/firewall-migration-backup/live-ruleset.nft
+    force: false
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Render authoritative policy from validated deployed allowances
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.d/ansible-host-filter.nft
+    owner: root
+    group: root
+    mode: '0644'
+    validate: /usr/sbin/nft --check --file %s
+  vars:
+    managed_firewall_app_ports: "{{ migration_preserved_ports }}"
+
+# Reuse the platform executor: it keeps the promoted allowances, applies the
+# complete ruleset, updates drift state, and installs its canonical boot wiring.
+- name: Apply authoritative firewall and platform wiring
+  ansible.builtin.include_tasks: main.yml
+  vars:
+    managed_firewall_manage_platform: true
+    managed_firewall_preserve_existing: true
+    managed_firewall_remove_unsupported_managers: true
+    managed_firewall_app_ports: []
+
+- name: Verify host remains reachable after firewall migration
+  ansible.builtin.wait_for_connection:
+    timeout: 60
+    connect_timeout: 5
+
+# The old unit is a oneshot without a resident process. Remove its activation
+# sources without restarting/stopping nftables (which can flush live policy).
+- name: Remove obsolete custom firewall unit and activation links
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/nftables.service.wants/ansible-host-firewall.service
+    - /etc/systemd/system/sysinit.target.wants/ansible-host-firewall.service
+    - /etc/systemd/system/multi-user.target.wants/ansible-host-firewall.service
+    - /etc/systemd/system/ansible-host-firewall.service
+
+- name: Reload systemd after retiring custom firewall wiring
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Validate standard firewall reload path
+  ansible.builtin.command:
+    argv: [/usr/sbin/nft, --check, --file, /etc/nftables.conf]
+  changed_when: false

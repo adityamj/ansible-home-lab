@@ -1,0 +1,52 @@
+---
+- name: Promote prestaged target Quadlets
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/quadlets/{{ item }}"
+    dest: "{{ podman_quadlet_dir }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ app_apply_plan.quadlets }}"
+
+- name: Promote prestaged target pasta units
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/units/{{ item }}"
+    dest: "{{ podman_user_unit_dir }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: '0644'
+  loop: "{{ app_apply_plan.units }}"
+
+- name: Promote prestaged normal target Caddy site
+  ansible.builtin.copy:
+    src: "{{ app_artifact_remote_dir }}/caddy/sites-enabled/{{ item }}"
+    dest: "{{ caddy_config_dir }}/sites-enabled/{{ item }}"
+    remote_src: true
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0644'
+  loop: "{{ app_apply_plan.caddy_sites }}"
+
+- name: Reload rootless systemd for prestaged target units
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+
+- name: Ensure migration gate directory exists
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}/migration-gates"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0750'
+
+- name: Keep target unavailable before final-copy verification
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}/migration-gates/{{ migration_gate_token }}"
+    state: absent

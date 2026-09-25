@@ -1,74 +1,558 @@
 ---
-- name: Fail if not Debian
-  ansible.builtin.fail:
-    msg: "This role currently supports Debian only."
-  when: ansible_facts.distribution != "Debian"
+- name: Validate platform and persistent storage settings
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ansible_facts.distribution == "Debian"
+      - ansible_facts.distribution_major_version in app_runtime_supported_debian_releases
+      - ssh_port is defined
+      - ssh_port | default(0) | int > 0
+      - ssh_port | default(0) | int < 65536
+      - ssh_port | default(0) | int == (ansible_port | default(22) | int)
+    fail_msg: >-
+      Detected {{ ansible_facts.distribution }} {{ ansible_facts.distribution_major_version }};
+      supported Debian releases are {{ app_runtime_supported_debian_releases | join(', ') }}.
+      ssh_port must match the Ansible connection port and be between 1 and 65535.
 
-- name: Update apt cache and upgrade system
+- name: Validate persistent storage settings
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/validate_storage.yml"
+
+- name: Verify persistent storage path before provisioning
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage_path.yml"
+
+- name: Set optional ZFS dataset names
+  ansible.builtin.set_fact:
+    app_host_zfs_root: "{{ use_zpool ~ '/app-host' if storage_mode == 'zfs' else '' }}"
+
+- name: Inspect plain persistent storage root
+  ansible.builtin.stat:
+    path: "{{ data_mount }}"
+    follow: false
+  register: plain_data_mount
+  when: storage_mode == 'plain'
+
+- name: Require safe plain persistent storage root
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not plain_data_mount.stat.exists or plain_data_mount.stat.isdir
+      - not plain_data_mount.stat.exists or not plain_data_mount.stat.islnk
+    fail_msg: "Plain data_mount must be absent or a real directory."
+  when: storage_mode == 'plain'
+
+- name: Create plain persistent storage root
+  ansible.builtin.file:
+    path: "{{ data_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: storage_mode == 'plain'
+
+- name: Verify configured ZFS pool
+  ansible.builtin.command:
+    argv:
+      - zpool
+      - list
+      - -H
+      - -o
+      - name
+      - "{{ use_zpool }}"
+  register: configured_zpool
+  changed_when: false
+  failed_when: configured_zpool.rc not in [0, 1]
+  when: storage_mode == 'zfs'
+
+- name: Require exact configured ZFS pool
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - configured_zpool.rc == 0
+      - configured_zpool.stdout_lines == [use_zpool]
+    fail_msg: "use_zpool must name an existing imported ZFS pool."
+  when: storage_mode == 'zfs'
+
+- name: Read configured ZFS pool alternate root
+  ansible.builtin.command:
+    argv:
+      - zpool
+      - get
+      - -H
+      - -o
+      - value
+      - altroot
+      - "{{ use_zpool }}"
+  register: configured_zpool_altroot
+  changed_when: false
+  when: storage_mode == 'zfs'
+
+- name: Reject a ZFS pool imported with an alternate root
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - configured_zpool_altroot.stdout == '-'
+    fail_msg: "use_zpool cannot use a pool imported with altroot."
+  when: storage_mode == 'zfs'
+
+- name: Preflight managed ZFS dataset destinations
+  ansible.builtin.include_tasks: zfs_dataset.yml
+  loop:
+    - name: app-host
+      path: "{{ data_mount }}"
+    - name: app-host/apps
+      path: "{{ app_data_base_path }}"
+    - name: app-host/static
+      path: "{{ static_base_path }}"
+    - name: app-host/system
+      path: "{{ data_mount }}/system"
+  loop_control:
+    loop_var: dataset
+    label: "{{ use_zpool }}/{{ dataset.name }}"
+  vars:
+    app_runtime_zfs_dataset_name: "{{ use_zpool }}/{{ dataset.name }}"
+    app_runtime_zfs_dataset_path: "{{ dataset.path }}"
+    app_runtime_zfs_dataset_properties: {}
+    app_runtime_zfs_inspect_only: true
+  when: storage_mode == 'zfs'
+
+- name: Reconcile root application ZFS dataset
+  ansible.builtin.include_tasks: zfs_dataset.yml
+  vars:
+    app_runtime_zfs_dataset_name: "{{ app_host_zfs_root }}"
+    app_runtime_zfs_dataset_path: "{{ data_mount }}"
+    app_runtime_zfs_dataset_properties:
+      recordsize: "131072"
+      compression: "off"
+  when: storage_mode == 'zfs'
+
+- name: Reconcile application ZFS child datasets
+  ansible.builtin.include_tasks: zfs_dataset.yml
+  loop:
+    - name: apps
+      path: "{{ app_data_base_path }}"
+      properties:
+        recordsize: "16384"
+        compression: "off"
+    - name: static
+      path: "{{ static_base_path }}"
+      properties:
+        recordsize: "131072"
+        compression: "off"
+    - name: system
+      path: "{{ data_mount }}/system"
+      properties:
+        recordsize: "131072"
+        compression: "off"
+  loop_control:
+    loop_var: dataset
+    label: "{{ app_host_zfs_root }}/{{ dataset.name }}"
+  vars:
+    app_runtime_zfs_dataset_name: "{{ app_host_zfs_root }}/{{ dataset.name }}"
+    app_runtime_zfs_dataset_path: "{{ dataset.path }}"
+    app_runtime_zfs_dataset_properties: "{{ dataset.properties }}"
+  when: storage_mode == 'zfs'
+
+- name: Verify prepared persistent storage
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Ensure storage guard directory
+  ansible.builtin.file:
+    path: /usr/local/libexec
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy runtime storage guard
+  ansible.builtin.template:
+    src: ansible-storage-ready.sh.j2
+    dest: /usr/local/libexec/ansible-storage-ready
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy generic container pasta launcher
+  ansible.builtin.copy:
+    src: pasta-for-container
+    dest: /usr/local/libexec/pasta-for-container
+    owner: root
+    group: root
+    mode: "0755"
+  register: pasta_launcher
+
+- name: Check cgroups v2 support
+  ansible.builtin.stat:
+    path: /sys/fs/cgroup/cgroup.controllers
+  register: cgroup_v2_stat
+
+- name: Read user namespace limit
+  ansible.builtin.slurp:
+    src: /proc/sys/user/max_user_namespaces
+  register: user_namespace_limit
+
+- name: Validate rootless container prerequisites
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - cgroup_v2_stat.stat.exists
+      - (user_namespace_limit.content | b64decode | trim | int) > 0
+    fail_msg: "Rootless Podman requires cgroups v2 and enabled user namespaces."
+
+- name: Refresh package metadata
   ansible.builtin.apt:
-    update_cache: yes
-    upgrade: dist
-    autoremove: yes
-    autoclean: yes
+    update_cache: true
+    cache_valid_time: 3600
 
-- name: Install all required packages
+- name: Install host runtime packages
   ansible.builtin.apt:
     name:
-      - curl
-      - gnupg2
+      - apparmor
       - ca-certificates
+      - curl
+      - crun
+      - fuse-overlayfs
+      - iproute2
       - nftables
       - podman
-      - uidmap
+      - passt
+      - rsync
       - slirp4netns
-      - fuse-overlayfs
-      - fail2ban
+      - uidmap
       - unattended-upgrades
-      - apparmor
-      - apparmor-utils
     state: present
 
-- name: Ensure podman user exists
+- name: Read installed Podman version
+  ansible.builtin.command:
+    argv:
+      - podman
+      - --version
+  register: podman_version_result
+  changed_when: false
+
+- name: Normalize installed Podman version
+  ansible.builtin.set_fact:
+    installed_podman_version: >-
+      {{ podman_version_result.stdout | regex_search('[0-9]+(?:\.[0-9]+)+') | default('0.0.0', true) }}
+
+- name: Require a Quadlet drop-in capable Podman release
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - installed_podman_version is version(podman_minimum_version, '>=')
+    fail_msg: >-
+      Podman {{ podman_minimum_version }} or newer is required; installed version
+      is {{ installed_podman_version }}.
+
+- name: Locate Quadlet system generator
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /usr/lib/systemd/system-generators/podman-system-generator
+    - /usr/local/lib/systemd/system-generators/podman-system-generator
+  register: quadlet_generator_paths
+
+- name: Require Quadlet system generator
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - quadlet_generator_paths.results | selectattr('stat.exists') | list | length > 0
+    fail_msg: "The Podman Quadlet systemd generator is not installed."
+
+- name: Validate rootless Podman account settings
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - podman_user not in ['root', '0']
+      - podman_group not in ['root', '0']
+    fail_msg: "podman_user and podman_group must identify a non-root account."
+
+- name: Ensure rootless Podman group exists
+  ansible.builtin.group:
+    name: "{{ podman_group }}"
+    state: present
+
+- name: Ensure rootless Podman user exists
   ansible.builtin.user:
     name: "{{ podman_user }}"
     group: "{{ podman_group }}"
-    create_home: yes
+    create_home: true
+    state: present
 
-- name: Ensure subuid and subgid ranges for podman user
-  ansible.builtin.lineinfile:
-    path: "{{ item.path }}"
-    regexp: "^{{ podman_user }}:"
-    line: "{{ podman_user }}:100000:65536"
-    create: true
-    mode: "0644"
+- name: Load rootless account identity after account provisioning
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_facts.yml"
+
+- name: Set subordinate allocation end
+  ansible.builtin.set_fact:
+    podman_subid_end: "{{ (podman_subid_start | int) + (podman_subid_count | int) - 1 }}"
+
+- name: Read subordinate ID databases
+  ansible.builtin.slurp:
+    src: "{{ item }}"
   loop:
-    - { path: /etc/subuid }
-    - { path: /etc/subgid }
+    - /etc/subuid
+    - /etc/subgid
+  register: subordinate_id_files
+
+- name: Parse subordinate ID allocations
+  ansible.builtin.set_fact:
+    subordinate_id_data: >-
+      {%- set result = {} -%}
+      {%- for source in subordinate_id_files.results -%}
+      {%-   set entries = [] -%}
+      {%-   for line in (source.content | b64decode).splitlines() -%}
+      {%-     set fields = line.split(':') -%}
+      {%-     if fields | length == 3 and fields[1].isdigit() and fields[2].isdigit() -%}
+      {%-       set _ = entries.append({'owner': fields[0], 'start': fields[1] | int, 'count': fields[2] | int}) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set _ = result.update({source.item: entries}) -%}
+      {%- endfor -%}
+      {{ result }}
+
+- name: Determine whether subordinate allocation needs initialization
+  ansible.builtin.set_fact:
+    podman_needs_subid_allocation: >-
+      {{ (subordinate_id_data['/etc/subuid'] | selectattr('owner', 'equalto', podman_user) | list | length == 0)
+         or (subordinate_id_data['/etc/subgid'] | selectattr('owner', 'equalto', podman_user) | list | length == 0) }}
+
+# Do not invoke Podman to discover storage until mappings are established: info
+# may initialize the store. Existing custom configurations require manual mapping
+# repair rather than assuming their graphroot is the default home directory.
+- name: Inspect explicit storage configuration before allocating subordinate IDs
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - /etc/containers/storage.conf
+    - "{{ podman_home }}/.config/containers/storage.conf"
+  register: podman_preallocation_storage_configs
+  when: podman_needs_subid_allocation
+
+- name: Require manual subordinate allocation for explicitly configured storage
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not item.stat.exists
+    fail_msg: >-
+      A subordinate ID allocation is missing and an explicit storage.conf exists.
+      Verify its graphroot and restore the correct mappings manually before retrying.
+  loop: "{{ podman_preallocation_storage_configs.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: podman_needs_subid_allocation
+
+- name: Inspect default storage before initializing subordinate IDs
+  ansible.builtin.stat:
+    path: "{{ podman_home }}/.local/share/containers/storage"
+    follow: false
+  register: podman_storage_stat
+  when: podman_needs_subid_allocation
+
+- name: Validate existing Podman subordinate ID allocations
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - subordinate_id_data[item] | selectattr('owner', 'equalto', podman_user) | list | length == 1
+      - (subordinate_id_data[item] | selectattr('owner', 'equalto', podman_user) | first).start | int == podman_subid_start | int
+      - (subordinate_id_data[item] | selectattr('owner', 'equalto', podman_user) | first).count | int == podman_subid_count | int
+    fail_msg: >-
+      Existing Podman subordinate IDs do not exactly match the configured range;
+      changing a live rootless mapping requires an explicit storage reset.
+  loop:
+    - /etc/subuid
+    - /etc/subgid
+  when: subordinate_id_data[item] | selectattr('owner', 'equalto', podman_user) | list | length > 0
+
+- name: Validate missing subordinate ID allocations are safe to add
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not podman_storage_stat.stat.exists
+      - >-
+        {%- set conflicts = [] -%}
+        {%- for entry in subordinate_id_data[item] -%}
+        {%-   if entry.owner != podman_user and entry.start < (podman_subid_end | int) + 1 and (podman_subid_start | int) < entry.start + entry.count -%}
+        {%-     set _ = conflicts.append(entry) -%}
+        {%-   endif -%}
+        {%- endfor -%}
+        {{ conflicts | length == 0 }}
+    fail_msg: >-
+      A subordinate ID allocation is missing, but the configured range is in
+      use or rootless container storage already exists. Resolve it manually.
+  loop:
+    - /etc/subuid
+    - /etc/subgid
+  when: subordinate_id_data[item] | selectattr('owner', 'equalto', podman_user) | list | length == 0
+
+- name: Add missing subordinate user ID allocation
+  ansible.builtin.command:
+    argv:
+      - usermod
+      - --add-subuids
+      - "{{ podman_subid_start }}-{{ podman_subid_end }}"
+      - "{{ podman_user }}"
+  changed_when: true
+  when: subordinate_id_data['/etc/subuid'] | selectattr('owner', 'equalto', podman_user) | list | length == 0
+
+- name: Add missing subordinate group ID allocation
+  ansible.builtin.command:
+    argv:
+      - usermod
+      - --add-subgids
+      - "{{ podman_subid_start }}-{{ podman_subid_end }}"
+      - "{{ podman_user }}"
+  changed_when: true
+  when: subordinate_id_data['/etc/subgid'] | selectattr('owner', 'equalto', podman_user) | list | length == 0
+
+- name: Verify storage before enabling rootless activation
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
 
 - name: Check linger status
   ansible.builtin.stat:
     path: "/var/lib/systemd/linger/{{ podman_user }}"
   register: linger_file
 
-- name: Enable linger for podman user
-  ansible.builtin.command: "loginctl enable-linger {{ podman_user }}"
+- name: Enable linger for rootless services
+  ansible.builtin.command:
+    argv:
+      - loginctl
+      - enable-linger
+      - "{{ podman_user }}"
+  changed_when: true
   when: not linger_file.stat.exists
 
-- name: Ensure required directories exist
+- name: Prepare rootless user systemd manager
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_systemd.yml"
+
+- name: Inspect rootless runtime path anchors
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ podman_home }}"
+    - "{{ podman_home }}/.local"
+    - "{{ podman_home }}/.local/share"
+    - "{{ podman_home }}/.local/share/containers"
+  register: rootless_runtime_path_anchors
+
+- name: Require safe rootless runtime path anchors
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - runtime_anchor.item != podman_home or runtime_anchor.stat.exists
+      - not runtime_anchor.stat.exists or runtime_anchor.stat.isdir
+      - not runtime_anchor.stat.exists or not runtime_anchor.stat.islnk
+    fail_msg: "A rootless runtime path anchor is not a safe directory."
+  loop: "{{ rootless_runtime_path_anchors.results }}"
+  loop_control:
+    loop_var: runtime_anchor
+    label: "{{ runtime_anchor.item }}"
+
+- name: Discover and validate effective rootless Podman storage
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/inspect_podman_storage.yml"
+
+- name: Ensure root-owned rootless Quadlet source directory
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure type-wide container Quadlet drop-in directory
+  ansible.builtin.file:
+    path: "{{ podman_quadlet_dir }}/container.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy rootless Podman route readiness helper
+  ansible.builtin.copy:
+    src: podman-wait-route
+    dest: /usr/local/libexec/podman-wait-route
+    owner: root
+    group: root
+    mode: "0755"
+  register: podman_route_readiness_helper
+
+- name: Deploy rootless Podman route readiness service
+  ansible.builtin.copy:
+    src: podman-route-ready.service
+    dest: /etc/systemd/user/podman-route-ready.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: podman_route_readiness_service
+
+- name: Require route readiness from every container Quadlet
+  ansible.builtin.copy:
+    src: quadlet-route-ready.conf
+    dest: "{{ podman_quadlet_dir }}/container.d/20-route-ready.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  register: podman_route_readiness_dropin
+
+- name: Reload rootless systemd after route readiness deployment
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: >-
+    podman_route_readiness_helper.changed
+    or podman_route_readiness_service.changed
+    or podman_route_readiness_dropin.changed
+
+- name: Reverify persistent storage before creating children
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Inspect persistent storage anchors
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ app_data_base_path }}"
+    - "{{ static_base_path }}"
+    - "{{ data_mount }}/system"
+  register: persistent_storage_anchor_stats
+
+- name: Require safe persistent storage anchors
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not anchor.stat.exists or anchor.stat.isdir
+      - not anchor.stat.exists or not anchor.stat.islnk
+    fail_msg: "A persistent storage anchor is not a safe directory."
+  loop: "{{ persistent_storage_anchor_stats.results }}"
+  loop_control:
+    loop_var: anchor
+    label: "{{ anchor.item }}"
+
+- name: Ensure persistent storage anchors are root-owned
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
-    owner: "{{ podman_user }}"
-    group: "{{ podman_group }}"
-    mode: "{{ '0700' if '/run/user' in item else '0755' }}"
+    owner: root
+    group: root
+    mode: "0755"
   loop:
+    - "{{ data_mount }}"
     - "{{ app_data_base_path }}"
-    - "/home/{{ podman_user }}/.config/containers"
-    - "/home/{{ podman_user }}/.local/share/containers"
-    - "/home/{{ podman_user }}/.config/containers/systemd"
-    - "/home/{{ podman_user }}/.config/containers/networks"
+    - "{{ data_mount }}/system"
 
-- name: Ensure SSH config directories exist
+- name: Create missing static storage anchor
+  ansible.builtin.file:
+    path: "{{ static_base_path }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: "2775"
+  when: not persistent_storage_anchor_stats.results[1].stat.exists
+
+- name: Ensure SSH configuration directory exists
   ansible.builtin.file:
     path: /etc/ssh/sshd_config.d
     state: directory
@@ -76,192 +560,63 @@
     group: root
     mode: "0755"
 
-- name: Deploy SSH hardening drop-in
+- name: Deploy validated SSH hardening configuration
   ansible.builtin.template:
     src: ssh_hardening.conf.j2
     dest: /etc/ssh/sshd_config.d/99-ansible-hardening.conf
     owner: root
     group: root
     mode: "0644"
-  notify: Restart ssh
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Reload ssh
 
-- name: Capture podman user UID
-  ansible.builtin.command: "id -u {{ podman_user }}"
-  register: podman_uid
-  changed_when: false
-
-- name: Ensure runtime dir and start systemd user manager
-  block:
-    - name: Ensure runtime dir exists
-      ansible.builtin.file:
-        path: "/run/user/{{ podman_uid.stdout }}"
-        state: directory
-        owner: "{{ podman_user }}"
-        group: "{{ podman_group }}"
-        mode: "0700"
-
-    - name: Check systemd user manager status
-      ansible.builtin.command: "systemctl is-active user@{{ podman_uid.stdout }}.service"
-      register: podman_user_manager_status
-      changed_when: false
-      failed_when: false
-
-    - name: Start systemd user manager
-      ansible.builtin.systemd:
-        name: "user@{{ podman_uid.stdout }}.service"
-        state: started
-      when: podman_user_manager_status.stdout | trim != 'active'
-
-- name: Enable Podman auto-update timer
-  ansible.builtin.systemd:
-    name: podman-auto-update.timer
-    enabled: true
-    scope: user
-  become: yes
-  become_user: "{{ podman_user }}"
-  environment:
-    XDG_RUNTIME_DIR: "/run/user/{{ podman_uid.stdout }}"
-
-- name: Allow unprivileged port binding
-  ansible.builtin.sysctl:
+- name: Lower unprivileged port boundary for rootless ingress
+  ansible.posix.sysctl:
     name: net.ipv4.ip_unprivileged_port_start
     value: "79"
     state: present
-    sysctl_file: /etc/sysctl.d/99-unprivileged-ports.conf
+    sysctl_file: /etc/sysctl.d/99-rootless-ingress.conf
     reload: true
 
-- name: Stop and disable UFW if present
-  ansible.builtin.systemd:
-    name: ufw
-    state: stopped
-    enabled: false
-  failed_when: false
-
-- name: Purge UFW to avoid netavark conflicts
-  ansible.builtin.apt:
-    name: ufw
-    state: absent
-    purge: true
-    autoremove: true
-
-- name: Deploy nftables ruleset
+- name: Configure unattended security upgrades
   ansible.builtin.template:
-    src: nftables.conf.j2
-    dest: /etc/nftables.conf
+    src: unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/50unattended-upgrades
     owner: root
     group: root
     mode: "0644"
-  notify: Reload nftables
 
-- name: Enable and start nftables
+- name: Enable unattended security upgrades
   ansible.builtin.systemd:
-    name: nftables
-    enabled: true
-    state: started
-
-- name: Enable and start AppArmor
-  ansible.builtin.systemd:
-    name: apparmor
+    name: unattended-upgrades
     state: started
     enabled: true
 
-- name: Enforce AppArmor profiles
-  ansible.builtin.command: "aa-enforce /etc/apparmor.d/*"
-  ignore_errors: true
-  changed_when: false
-
-- name: Configure and enable unattended-upgrades
-  block:
-    - name: Configure unattended-upgrades
-      ansible.builtin.template:
-        src: unattended-upgrades.j2
-        dest: /etc/apt/apt.conf.d/50unattended-upgrades
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Enable and start unattended-upgrades
-      ansible.builtin.systemd:
-        name: unattended-upgrades
-        state: started
-        enabled: true
-
-- name: Configure and enable fail2ban
-  block:
-    - name: Configure fail2ban
-      ansible.builtin.template:
-        src: jail.local.j2
-        dest: /etc/fail2ban/jail.local
-        owner: root
-        group: root
-        mode: "0644"
-      notify: Restart fail2ban after config
-
-    - name: Enable and start fail2ban
-      ansible.builtin.systemd:
-        name: fail2ban
-        state: started
-        enabled: true
-
-- name: Apply sysctl hardening
-  ansible.builtin.sysctl:
+- name: Apply focused kernel hardening
+  loop_control:
+    label: "{{ item.name }}"
+  ansible.posix.sysctl:
     name: "{{ item.name }}"
     value: "{{ item.value }}"
     state: present
-    sysctl_file: /etc/sysctl.d/99-ansible-hardening.conf
+    sysctl_file: /etc/sysctl.d/99-application-host.conf
     reload: true
   loop:
-    - { name: 'kernel.kptr_restrict', value: '1' }
-    - { name: 'kernel.dmesg_restrict', value: '1' }
-    - { name: 'kernel.perf_event_paranoid', value: '3' }
-    - { name: 'vm.swappiness', value: '10' }
-    - { name: 'net.ipv4.tcp_syncookies', value: '1' }
-    - { name: 'net.ipv4.conf.all.accept_redirects', value: '0' }
-    - { name: 'net.ipv4.conf.default.accept_redirects', value: '0' }
-    - { name: 'net.ipv6.conf.all.accept_redirects', value: '0' }
-    - { name: 'net.ipv6.conf.default.accept_redirects', value: '0' }
-    - { name: 'net.ipv4.conf.all.send_redirects', value: '0' }
-    - { name: 'net.ipv4.conf.default.send_redirects', value: '0' }
+    - { name: kernel.kptr_restrict, value: "1" }
+    - { name: kernel.dmesg_restrict, value: "1" }
+    - { name: kernel.perf_event_paranoid, value: "3" }
+    - { name: net.ipv4.tcp_syncookies, value: "1" }
+    - { name: net.ipv4.conf.all.accept_redirects, value: "0" }
+    - { name: net.ipv4.conf.default.accept_redirects, value: "0" }
+    - { name: net.ipv6.conf.all.accept_redirects, value: "0" }
+    - { name: net.ipv6.conf.default.accept_redirects, value: "0" }
+    - { name: net.ipv4.conf.all.send_redirects, value: "0" }
+    - { name: net.ipv4.conf.default.send_redirects, value: "0" }
 
-- name: Secure /tmp mount
-  ansible.builtin.lineinfile:
-    path: /etc/fstab
-    regexp: '^.* /tmp .*'
-    line: "tmpfs /tmp tmpfs defaults,noexec,nosuid,nodev 0 0"
-    create: false
-  register: tmp_fstab_hardening
-
-- name: Remount /tmp with hardened options
-  ansible.builtin.command: mount -o remount,noexec,nosuid,nodev /tmp
-  when: tmp_fstab_hardening.changed
-
-- name: Validate and enforce data mount ownership
-  become: true
-  block:
-    - name: Validate required variables
-      ansible.builtin.assert:
-        that:
-          - data_mount is defined
-          - podman_user is defined
-          - podman_group is defined
-          - data_mount | length > 1
-          - data_mount.startswith('/')
-          - data_mount != '/'
-        fail_msg: "data_mount/podman_user/podman_group are invalid or unsafe."
-    - name: Check data_mount path exists
-      ansible.builtin.stat:
-        path: "{{ data_mount }}"
-      register: data_mount_stat
-    - name: Ensure data_mount exists and is a directory
-      ansible.builtin.assert:
-        that:
-          - data_mount_stat.stat.exists
-          - data_mount_stat.stat.isdir
-        fail_msg: "data_mount '{{ data_mount }}' must exist and be a directory."
-    - name: Ensure base directory ownership
-      ansible.builtin.file:
-        path: "{{ data_mount }}"
-        state: directory
-        owner: "{{ podman_user }}"
-        group: "{{ podman_group }}"
-        mode: "0755"
+- name: Enforce persistent storage ownership
+  ansible.builtin.file:
+    path: "{{ data_mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"

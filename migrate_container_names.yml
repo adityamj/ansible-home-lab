@@ -1,0 +1,12 @@
+---
+- name: Migrate legacy container names
+  hosts: app_hosts
+  become: true
+  gather_facts: false
+  vars:
+    target_app: "{{ app | default('') | string | trim }}"
+  tasks:
+    - name: Run one-time migration
+      ansible.builtin.include_role:
+        name: apps
+        tasks_from: migrate_container_names

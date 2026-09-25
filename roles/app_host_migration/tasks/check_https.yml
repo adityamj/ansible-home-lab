@@ -1,0 +1,34 @@
+---
+- name: Verify HTTPS, certificate and non-error response directly from controller
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/curl
+      - --silent
+      - --show-error
+      - --noproxy
+      - '*'
+      - --connect-timeout
+      - '10'
+      - --max-time
+      - '30'
+      - --resolve
+      - "{{ item.1 }}:443:{{ item.0 }}"
+      - --output
+      - /dev/null
+      - --write-out
+      - '%{http_code}'
+      - "https://{{ item.1 }}/"
+  loop: "{{ migration_check_addresses | product(migration_model.domains) | list }}"
+  loop_control:
+    label: "{{ item.1 }} via {{ item.0 }}"
+  delegate_to: localhost
+  become: false
+  register: migration_https_checks
+  changed_when: false
+  failed_when: false
+  until: >-
+    migration_https_checks.rc == 0
+    and migration_https_checks.stdout | int >= 200
+    and migration_https_checks.stdout | int < 500
+  retries: 10
+  delay: 3

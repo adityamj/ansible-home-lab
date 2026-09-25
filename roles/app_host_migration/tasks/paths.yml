@@ -1,0 +1,125 @@
+---
+- name: Reverify platform storage immediately before transfer
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Inspect canonical volume roots
+  ansible.builtin.command:
+    argv: [realpath, '-m', "{{ data_mount }}/apps/{{ migration_app }}/volumes/{{ item }}"]
+  loop: "{{ migration_volume_names }}"
+  register: migration_canonical_paths
+  changed_when: false
+  failed_when: migration_canonical_paths.stdout != data_mount ~ '/apps/' ~ migration_app ~ '/volumes/' ~ item
+
+- name: Inspect declared volume roots
+  ansible.builtin.stat:
+    path: "{{ data_mount }}/apps/{{ migration_app }}/volumes/{{ item }}"
+    follow: false
+  loop: "{{ migration_volume_names }}"
+  register: migration_roots
+
+- name: Require source directories and isolated target directories
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname != source_host or item.stat.exists
+      - not item.stat.exists or (item.stat.isdir and not item.stat.islnk)
+  loop: "{{ migration_roots.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Reject nested mounts inside migrated volumes
+  ansible.builtin.shell: |
+    set -eu
+    findmnt --json --list --output TARGET | python3 -c '
+    import json,sys
+    root=sys.argv[1].rstrip("/")+"/"
+    mounts=json.load(sys.stdin)["filesystems"]
+    assert not any(m["target"].startswith(root) for m in mounts), "nested mounts require separate review"
+    ' {{ (data_mount ~ '/apps/' ~ migration_app ~ '/volumes/' ~ item) | quote }}
+  args:
+    executable: /bin/bash
+  loop: "{{ migration_volume_names }}"
+  changed_when: false
+
+- name: Measure source allocation and inode requirements
+  ansible.builtin.command:
+    argv: [du, '-s', '-B1', "{{ data_mount }}/apps/{{ migration_app }}/volumes/{{ item }}"]
+  loop: "{{ migration_volume_names }}"
+  when: inventory_hostname == source_host
+  register: migration_sizes
+  changed_when: false
+
+- name: Measure source inode requirements
+  ansible.builtin.command:
+    argv: [du, '-s', '--inodes', "{{ data_mount }}/apps/{{ migration_app }}/volumes/{{ item }}"]
+  loop: "{{ migration_volume_names }}"
+  when: inventory_hostname == source_host
+  register: migration_inodes
+  changed_when: false
+
+- name: Inspect canonical static data root
+  ansible.builtin.command:
+    argv: [realpath, '-m', "{{ migration_static_root }}"]
+  register: migration_static_canonical_path
+  changed_when: false
+  failed_when: migration_static_canonical_path.stdout != static_base_path ~ '/' ~ migration_app
+  when: migration_has_static_data | bool
+
+- name: Inspect declared static data root
+  ansible.builtin.stat:
+    path: "{{ migration_static_root }}"
+    follow: false
+  register: migration_static_root_stat
+  when: migration_has_static_data | bool
+
+- name: Require source static directory and isolated target path
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname != source_host or migration_static_root_stat.stat.exists
+      - not migration_static_root_stat.stat.exists or (migration_static_root_stat.stat.isdir and not migration_static_root_stat.stat.islnk)
+  when: migration_has_static_data | bool
+
+- name: Reject nested mounts inside migrated static data
+  ansible.builtin.shell: |
+    set -eu
+    findmnt --json --list --output TARGET | python3 -c '
+    import json,sys
+    root=sys.argv[1].rstrip("/")+"/"
+    mounts=json.load(sys.stdin)["filesystems"]
+    assert not any(m["target"].startswith(root) for m in mounts), "nested mounts require separate review"
+    ' {{ migration_static_root | quote }}
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: migration_has_static_data | bool
+
+- name: Measure source static allocation
+  ansible.builtin.command:
+    argv: [du, '-s', '-B1', "{{ migration_static_root }}"]
+  when:
+    - inventory_hostname == source_host
+    - migration_has_static_data | bool
+  register: migration_static_size
+  changed_when: false
+
+- name: Measure source static inode requirements
+  ansible.builtin.command:
+    argv: [du, '-s', '--inodes', "{{ migration_static_root }}"]
+  when:
+    - inventory_hostname == source_host
+    - migration_has_static_data | bool
+  register: migration_static_inodes
+  changed_when: false
+
+- name: Measure target free byte capacity
+  ansible.builtin.command:
+    argv: [df, '-B1', '--output=avail', "{{ data_mount }}"]
+  when: inventory_hostname == target_host
+  register: migration_free
+  changed_when: false
+
+- name: Measure target free inode capacity
+  ansible.builtin.command:
+    argv: [df, '--output=iavail', "{{ data_mount }}"]
+  when: inventory_hostname == target_host
+  register: migration_ifree
+  changed_when: false

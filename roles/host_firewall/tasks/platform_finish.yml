@@ -1,0 +1,22 @@
+---
+- name: Validate system nftables entry point
+  ansible.builtin.command:
+    argv: [/usr/sbin/nft, --check, --file, /etc/nftables.conf]
+  changed_when: false
+
+# Package maintainer scripts can change live rules before apt reports a failure.
+# Always restore policy after an attempted removal, including partial failures.
+# Without a rescue clause Ansible still reports the original removal failure.
+- name: Retire unsupported firewall managers with policy restoration
+  when: managed_firewall_remove_unsupported_managers
+  block:
+    - name: Remove unsupported firewall managers
+      ansible.builtin.apt:
+        name: [fail2ban, ufw, firewalld, netfilter-persistent, iptables-persistent]
+        state: absent
+        purge: true
+  always:
+    - name: Restore authoritative policy after firewall manager removal attempt
+      ansible.builtin.command:
+        argv: [/usr/sbin/nft, --file, /etc/nftables.d/ansible-host-filter.nft]
+      changed_when: true

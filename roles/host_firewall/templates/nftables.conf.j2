@@ -1,0 +1,31 @@
+#!/usr/sbin/nft -f
+
+# Managed by Ansible. Authoritative host nftables ruleset.
+
+{% set allowed_tcp_ports = [ssh_port | int, 80, 443] %}
+{% set allowed_udp_ports = [443] %}
+{% for binding in managed_firewall_app_ports %}
+{% if binding.protocol == 'tcp' %}
+{% set _ = allowed_tcp_ports.append(binding.host_port | int) %}
+{% else %}
+{% set _ = allowed_udp_ports.append(binding.host_port | int) %}
+{% endif %}
+{% endfor %}
+# Flush and replacement are submitted together as one atomic nft transaction.
+flush ruleset
+
+table inet ansible_host_filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        ip protocol icmp accept
+        ip6 nexthdr icmpv6 accept
+
+        tcp dport { {{ allowed_tcp_ports | unique | sort | join(', ') }} } ct state new accept
+        udp dport { {{ allowed_udp_ports | unique | sort | join(', ') }} } ct state new accept
+    }
+}

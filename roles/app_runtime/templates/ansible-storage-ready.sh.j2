@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+data_mount={{ data_mount | quote }}
+[ "$(realpath --canonicalize-missing "$data_mount")" = "$data_mount" ]
+
+case {{ storage_mode | quote }} in
+  mount)
+    mountpoint --quiet "$data_mount"
+    ;;
+  zfs)
+    check_mount() {
+      [ "$(findmnt --noheadings --output SOURCE,FSTYPE --mountpoint "$1")" = "$2 zfs" ]
+    }
+    check_mount "$data_mount" {{ (use_zpool ~ '/app-host') | quote }}
+    check_mount "$data_mount/apps" {{ (use_zpool ~ '/app-host/apps') | quote }}
+    check_mount "$data_mount/static" {{ (use_zpool ~ '/app-host/static') | quote }}
+    check_mount "$data_mount/system" {{ (use_zpool ~ '/app-host/system') | quote }}
+    ;;
+  plain)
+    [ -d "$data_mount" ]
+    [ ! -L "$data_mount" ]
+    ! mountpoint --quiet "$data_mount"
+    ;;
+  *)
+    exit 1
+    ;;
+esac

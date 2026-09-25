@@ -1,0 +1,29 @@
+---
+- name: Reconcile host firewall for application ports
+  ansible.builtin.include_role:
+    name: host_firewall
+  vars:
+    managed_firewall_app_ports: "{{ app_apply_plan.published_ports }}"
+    managed_firewall_manage_platform: false
+    managed_firewall_force_refresh: "{{ force_refresh }}"
+  when: not deployment_is_targeted or app_reconcile_targeted_firewall | bool
+
+# Successful full deployment prunes ownership to desired resources. Targeted
+# deployment retains unrelated ownership for the next full garbage collection.
+- name: Save successful host metadata and resource ownership
+  ansible.builtin.copy:
+    content: |
+      {%- set state = {} -%}
+      {%- set preserve_assignment = app_model_preserve_committed_assignment | default(false) | bool -%}
+      {%- for key in ['version', 'naming_scheme', 'assigned_apps', 'assigned_apps_digest', 'inventory_topology_digest', 'published_ports'] -%}
+      {%- set value = previous_host_state.get(key, app_apply_plan[key]) if preserve_assignment else app_apply_plan[key] -%}
+      {%- set _ = state.update({key: value}) -%}
+      {%- endfor -%}
+      {%- for key in app_recorded_ownership -%}
+      {%- set _ = state.update({key: (app_recorded_ownership[key] if deployment_is_targeted else app_apply_plan[key]) | unique | sort}) -%}
+      {%- endfor -%}
+      {{ state | to_nice_json }}
+    dest: "{{ app_artifact_previous_path }}"
+    owner: root
+    group: root
+    mode: '0600'

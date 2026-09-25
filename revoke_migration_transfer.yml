@@ -1,0 +1,24 @@
+---
+- name: Revoke interrupted migration transfer credentials
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    migration_state_dir: /var/lib/ansible-app-host/migrations
+    migration_id: "{{ migration_app }}-{{ source_host }}-to-{{ target_host }}"
+    migration_transfer_state_dir: "{{ migration_state_dir }}/{{ migration_app }}-transfer"
+    migration_transfer_key_path: "{{ migration_transfer_state_dir }}/id_ed25519"
+    migration_static_transfer_key_path: "{{ migration_transfer_state_dir }}/id_ed25519_static"
+    migration_transfer_known_hosts_path: "{{ migration_transfer_state_dir }}/known_hosts"
+  pre_tasks:
+    - name: Validate revocation scope
+      ansible.builtin.assert:
+        that:
+          - migration_app is match('^[a-z0-9][a-z0-9-]*$')
+          - source_host != target_host
+          - ansible_play_hosts_all | sort == [source_host, target_host] | sort
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: remove_transfer

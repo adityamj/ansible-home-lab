@@ -1,0 +1,72 @@
+---
+- name: Require both live records to permit source-to-target copy
+  ansible.builtin.assert:
+    that:
+      - not hostvars[source_host].migration_record.target_activation_attempted
+      - not hostvars[target_host].migration_record.target_activation_attempted
+      - not migration_final_copy or migration_approve_target_prune | bool
+      - hostvars[target_host].migration_fenced | default(false)
+      - not migration_final_copy or hostvars[source_host].migration_fenced | default(false)
+
+- name: Copy only reviewed named volume contents over verified SSH
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-aHAX', '--numeric-ids', '--itemize-changes']
+         + (['--checksum'] if (migration_final_copy or (migration_checksum_copy | default(false) | bool)) else [])
+         + (['--delete-delay'] if migration_final_copy else [])
+         + ['-e', migration_rsync_ssh ~ ' -o StrictHostKeyChecking=yes -o BatchMode=yes', '--',
+            hostvars[source_host].data_mount ~ '/apps/' ~ migration_app ~ '/volumes/' ~ item ~ '/',
+            migration_transfer_destination ~ ':' ~ item ~ '/'] }}
+  loop: "{{ migration_volume_names }}"
+  register: migration_transfer
+  changed_when: migration_transfer.stdout | length > 0
+
+- name: Copy reviewed static tree over its isolated receiver
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-aHAX', '--numeric-ids', '--itemize-changes']
+         + (['--checksum'] if (migration_final_copy or (migration_checksum_copy | default(false) | bool)) else [])
+         + (['--delete-delay'] if migration_final_copy else [])
+         + ['-e', migration_static_rsync_ssh ~ ' -o StrictHostKeyChecking=yes -o BatchMode=yes', '--',
+            migration_static_root ~ '/', migration_transfer_destination ~ ':.'] }}
+  register: migration_static_transfer
+  changed_when: migration_static_transfer.stdout | length > 0
+  when: migration_has_static_data | bool
+
+- name: Verify exact final mirror with itemized checksum dry run
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-aHAX', '--numeric-ids', '--checksum', '--delete-delay', '--dry-run', '--itemize-changes',
+          '-e', migration_rsync_ssh ~ ' -o StrictHostKeyChecking=yes -o BatchMode=yes', '--',
+          hostvars[source_host].data_mount ~ '/apps/' ~ migration_app ~ '/volumes/' ~ item ~ '/',
+          migration_transfer_destination ~ ':' ~ item ~ '/'] }}
+  loop: "{{ migration_volume_names }}"
+  register: migration_verification
+  changed_when: false
+  failed_when: migration_verification.rc != 0 or migration_verification.stdout | trim | length > 0
+  when: migration_final_copy
+
+- name: Verify exact final static mirror with itemized checksum dry run
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-aHAX', '--numeric-ids', '--checksum', '--delete-delay', '--dry-run', '--itemize-changes',
+          '-e', migration_static_rsync_ssh ~ ' -o StrictHostKeyChecking=yes -o BatchMode=yes', '--',
+          migration_static_root ~ '/', migration_transfer_destination ~ ':.'] }}
+  register: migration_static_verification
+  changed_when: false
+  failed_when: migration_static_verification.rc != 0 or migration_static_verification.stdout | trim | length > 0
+  when:
+    - migration_final_copy
+    - migration_has_static_data | bool
+
+# This is deliberately last. Source Caddy's active check cannot select the
+# target until every final mirror has passed its checksum dry-run.
+- name: Open target final-copy gate atomically
+  ansible.builtin.copy:
+    dest: "{{ caddy_config_dir }}/migration-gates/{{ migration_gate_token }}"
+    content: "ready\n"
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0640'
+  delegate_to: "{{ target_host }}"
+  when: migration_final_copy

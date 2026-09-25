@@ -1,0 +1,45 @@
+---
+- name: Validate managed firewall settings
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ssh_port is defined
+      - ssh_port | default(0) | int > 0
+      - ssh_port | default(0) | int < 65536
+      - managed_firewall_app_ports is sequence
+      - managed_firewall_app_ports is not string
+      - managed_firewall_preserve_existing is boolean
+      - managed_firewall_force_refresh is boolean
+      - managed_firewall_remove_unsupported_managers is boolean
+    fail_msg: "The SSH port and managed application firewall bindings must be valid."
+
+- name: Validate managed application firewall bindings
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - binding.owner is defined
+      - binding.owner is match('^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*$')
+      - binding.host_port | int > 0
+      - binding.host_port | int < 65536
+      - binding.protocol in ['tcp', 'udp']
+    fail_msg: "Invalid managed firewall binding for {{ binding.owner | default('unknown') }}."
+  loop: "{{ managed_firewall_app_ports }}"
+  loop_control:
+    loop_var: binding
+    label: "{{ binding.owner | default('unknown') }}"
+
+- name: Build managed firewall allocation keys
+  ansible.builtin.set_fact:
+    managed_firewall_allocation_keys: >-
+      {%- set keys = ['tcp:' ~ (ssh_port | int | string), 'tcp:80', 'tcp:443', 'udp:443'] -%}
+      {%- for binding in managed_firewall_app_ports -%}
+      {%-   set _ = keys.append(binding.protocol ~ ':' ~ (binding.host_port | int | string)) -%}
+      {%- endfor -%}
+      {{ keys }}
+
+- name: Reject conflicting managed firewall allocations
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - managed_firewall_allocation_keys | length == managed_firewall_allocation_keys | unique | list | length
+    fail_msg: "SSH, Caddy, and application host-port allocations must be unique per protocol."

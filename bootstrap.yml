@@ -1,19 +1,13 @@
 ---
-- name: Prepare homelab hosts
-  hosts: homelab_servers
+- name: Prepare application hosts
+  hosts: app_hosts
   become: true
   gather_facts: true
 
   roles:
     - app_runtime
-
-- name: Deploy applications
-  hosts: homelab_servers
-  become: true
-  gather_facts: false
-
-  vars:
-    target_app: "{{ app | default('') }}"  # Optional: limit to single app
-
-  roles:
-    - apps
+    - role: host_firewall
+      managed_firewall_app_ports: []
+      managed_firewall_preserve_existing: true
+      managed_firewall_remove_unsupported_managers: true
+    - caddy_host

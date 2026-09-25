@@ -1,0 +1,45 @@
+---
+migration_phase: all
+# Common storage verification is also called from migration-only plays where
+# the apps/app_runtime role defaults are not in scope.
+app_data_base_path: "{{ data_mount }}/apps"
+static_base_path: "{{ data_mount }}/static"
+migration_dependency_apps: []
+migration_state_dir: /var/lib/ansible-app-host/migrations
+migration_id: "{{ migration_app }}-{{ source_host }}-to-{{ target_host }}"
+migration_confirm_cutover: false
+migration_approve_target_prune: false
+migration_operator_serialized: false
+# reject: no direct host ports; outage_until_dns: declared TCP/UDP ports are
+# opened only on the target and intentionally unavailable through the old address.
+migration_direct_port_policy: reject
+# Reviewed argv lists, run on each host. Nonzero exits stop the workflow.
+# preflight: backup, all writers/activation paths, namespace and storage review.
+# frozen: prove clean shutdown, no writers, and offline consistency.
+# healthy: application-level data/integration check on the target.
+migration_preflight_argv: []
+migration_frozen_argv: []
+migration_healthy_argv: []
+migration_cleanup_argv: []
+migration_confirm_endpoint_retirement: false
+# Source Caddy waits on the opaque final-copy gate before selecting target Caddy.
+migration_handoff_retry_duration: 30s
+migration_handoff_retry_interval: 250ms
+migration_handoff_health_interval: 250ms
+migration_handoff_health_timeout: 2s
+migration_target_address: "{{ hostvars[target_host].ansible_host | default(target_host) }}"
+# Ephemeral root-capable transfer credentials are generated automatically. The
+# target key is forced through write-only rrsync and independently expires.
+migration_transfer_destination: "root@{{ target_host }}"
+migration_transfer_state_dir: "{{ migration_state_dir }}/{{ migration_app }}-transfer"
+migration_transfer_key_path: "{{ migration_transfer_state_dir }}/id_ed25519"
+migration_static_transfer_key_path: "{{ migration_transfer_state_dir }}/id_ed25519_static"
+migration_transfer_known_hosts_path: "{{ migration_transfer_state_dir }}/known_hosts"
+migration_rsync_ssh: >-
+  /usr/bin/ssh -i {{ migration_transfer_key_path }}
+  -o UserKnownHostsFile={{ migration_transfer_known_hosts_path }}
+  -o IdentitiesOnly=yes
+migration_static_rsync_ssh: >-
+  /usr/bin/ssh -i {{ migration_static_transfer_key_path }}
+  -o UserKnownHostsFile={{ migration_transfer_known_hosts_path }}
+  -o IdentitiesOnly=yes

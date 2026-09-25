@@ -1,0 +1,576 @@
+---
+# Operator serialization applies across failures/reboots until inventory and
+# routing ownership are reconciled, not merely while this process is running.
+- name: Preflight both exact migration hosts
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  roles:
+    - app_host_migration
+  tasks:
+    - name: Reobserve all declared data paths
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: paths
+
+    - name: Compare host identities and reviewed app plans
+      ansible.builtin.assert:
+        that:
+          - hostvars[source_host].podman_uid == hostvars[target_host].podman_uid
+          - hostvars[source_host].podman_gid == hostvars[target_host].podman_gid
+          - hostvars[source_host].migration_subids.results | map(attribute='stdout') | list == hostvars[target_host].migration_subids.results | map(attribute='stdout') | list
+          # After handoff the source is draining while the target is running,
+          # so host-scoped models intentionally differ. Cleanup performs no copy.
+          - migration_phase == 'cleanup' or hostvars[source_host].migration_model_digest == hostvars[target_host].migration_model_digest
+          - (hostvars[source_host].migration_record == {}) == (hostvars[target_host].migration_record == {})
+        fail_msg: >-
+          Host mappings, catalog or migration records disagree. source uid/gid={{ hostvars[source_host].podman_uid }}/{{ hostvars[source_host].podman_gid }},
+          target uid/gid={{ hostvars[target_host].podman_uid }}/{{ hostvars[target_host].podman_gid }},
+          source subids={{ hostvars[source_host].migration_subids.results | map(attribute='stdout') | list }},
+          target subids={{ hostvars[target_host].migration_subids.results | map(attribute='stdout') | list }},
+          source model={{ hostvars[source_host].migration_model_digest }}, target model={{ hostvars[target_host].migration_model_digest }}.
+          Do not copy numeric ownership until mappings match.
+
+    - name: Require target free bytes and inodes with warm-copy margin
+      ansible.builtin.assert:
+        that:
+          - >-
+            hostvars[target_host].migration_free.stdout_lines[-1] | trim | int
+            > ((hostvars[source_host].migration_sizes.results | map(attribute='stdout') | map('regex_replace', '\\s.*$', '') | map('int') | sum)
+               + (hostvars[source_host].migration_static_size.stdout | default('0') | regex_replace('\\s.*$', '') | int)) * 1.2
+          - >-
+            hostvars[target_host].migration_ifree.stdout_lines[-1] | trim | int
+            > ((hostvars[source_host].migration_inodes.results | map(attribute='stdout') | map('regex_replace', '\\s.*$', '') | map('int') | sum)
+               + (hostvars[source_host].migration_static_inodes.stdout | default('0') | regex_replace('\\s.*$', '') | int)) * 1.2
+      when: migration_phase in ['prepare', 'all']
+
+    - name: Generate an opaque readiness-gate token once
+      ansible.builtin.command:
+        argv: [openssl, rand, -hex, '32']
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      register: migration_gate_token_command
+      when: migration_record.gate_token | default('') is not match('^[a-f0-9]{64}$')
+
+    - name: Publish the persisted or newly generated readiness-gate token
+      ansible.builtin.set_fact:
+        migration_gate_token: >-
+          {{ migration_record.gate_token
+             if migration_record.gate_token | default('') is match('^[a-f0-9]{64}$')
+             else hostvars[ansible_play_hosts_all | first].migration_gate_token_command.stdout }}
+
+    - name: Require identical opaque readiness-gate state
+      ansible.builtin.assert:
+        that:
+          - migration_gate_token is match('^[a-f0-9]{64}$')
+          - hostvars[source_host].migration_gate_token == hostvars[target_host].migration_gate_token
+
+    - name: Persist reviewed migration identity on both hosts
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: save
+      vars:
+        migration_update:
+          gate_token: "{{ migration_gate_token }}"
+
+- name: Resolve immutable image identities from running source containers
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: resolve_images
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+
+- name: Commit identical source image selection on both hosts
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Publish source-resolved image map
+      ansible.builtin.set_fact:
+        migration_resolved_images: "{{ hostvars[source_host].migration_resolved_images }}"
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+    - name: Refuse image drift across migration retries
+      ansible.builtin.assert:
+        that:
+          - migration_record.image_digests is not defined or migration_record.image_digests == migration_resolved_images
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: save
+      vars:
+        migration_update:
+          image_digests: "{{ migration_resolved_images }}"
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+
+- name: Fence target before any copy
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    target_app: "{{ migration_app }}"
+    app_model_assigned_apps: "{{ ((assigned_apps | default([])) + (migration_overlay_apps | default([])) + [migration_app]) | unique | list }}"
+    app_model_desired_states: "{{ (app_desired_states | default({})) | combine({migration_app: 'inactive'}) }}"
+    app_model_allow_uncommitted_assignment: true
+    app_model_preserve_committed_assignment: true
+    app_reconcile_migration_volume_roots: true
+  tasks:
+    - name: Prepare and fence target before copying
+      when: migration_phase | default('all') in ['prepare', 'all']
+      block:
+        - name: Prepare app-scoped target artifacts
+          ansible.builtin.import_role:
+            name: apps
+            tasks_from: prepare
+        - name: Install persistent masks and verify target containers stopped
+          ansible.builtin.import_role:
+            name: apps
+            tasks_from: fence_inactive
+        - name: Record observed target fence for this invocation
+          ansible.builtin.set_fact:
+            migration_fenced: true
+        - name: Create target volume roots with source root metadata
+          ansible.builtin.file:
+            path: "{{ volume_dir.path }}"
+            state: directory
+            owner: "{{ migration_source_volume_root.stat.uid }}"
+            group: "{{ migration_source_volume_root.stat.gid }}"
+            mode: "{{ migration_source_volume_root.stat.mode }}"
+          loop: "{{ app_apply_plan.volume_dirs }}"
+          loop_control:
+            loop_var: volume_dir
+            label: "{{ volume_dir.path }}"
+          vars:
+            migration_source_volume_root: >-
+              {{ hostvars[source_host].migration_roots.results
+                 | selectattr('item', 'equalto', volume_dir.path | basename) | first }}
+        - name: Create target static root with source metadata
+          ansible.builtin.file:
+            path: "{{ migration_static_root }}"
+            state: directory
+            owner: "{{ hostvars[source_host].migration_static_root_stat.stat.uid }}"
+            group: "{{ hostvars[source_host].migration_static_root_stat.stat.gid }}"
+            mode: "{{ hostvars[source_host].migration_static_root_stat.stat.mode }}"
+          when: migration_has_static_data | bool
+
+- name: Verify the prepared target fence for cutover
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect prepared target service masks
+      ansible.builtin.stat:
+        path: "{{ podman_home }}/.config/systemd/user/{{ item }}"
+        follow: false
+      loop: "{{ migration_service_names }}"
+      register: migration_cutover_target_masks
+      when: migration_phase | default('all') == 'cutover'
+    - name: Require every prepared target service to remain masked
+      ansible.builtin.assert:
+        that:
+          - item.stat.islnk | default(false)
+          - item.stat.lnk_source | default('') == '/dev/null'
+      loop: "{{ migration_cutover_target_masks.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: migration_phase | default('all') == 'cutover'
+    - ansible.builtin.set_fact:
+        migration_fenced: true
+      when: migration_phase | default('all') == 'cutover'
+
+- name: Establish expiring restricted transfer access
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: setup_transfer
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+
+- name: Warm data transfer while source remains live
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Initial nondeleting rsync
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: transfer
+      vars:
+        migration_final_copy: false
+      when: migration_phase | default('all') in ['prepare', 'all']
+
+- name: Pull immutable images and restore unchanged catalog tags
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Recover immutable image selection after activation barrier
+      ansible.builtin.set_fact:
+        migration_resolved_images: "{{ migration_record.image_digests }}"
+      when: migration_phase | default('all') == 'handoff'
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: prepare_images
+      when: migration_phase | default('all') in ['prepare', 'all', 'handoff']
+
+- name: Relay target HTTP-01 challenges through the live source route
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: route
+      vars:
+        migration_route: http01-relay
+      when: migration_phase | default('all') in ['prepare', 'all']
+
+- name: Stage normal Quadlets under persistent target masks
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    target_app: "{{ migration_app }}"
+    app_model_assigned_apps: "{{ ((assigned_apps | default([])) + (migration_overlay_apps | default([])) + [migration_app]) | unique | list }}"
+    app_model_desired_states: "{{ (app_desired_states | default({})) | combine({migration_app: 'running'}) }}"
+    app_model_allow_uncommitted_assignment: true
+    app_model_preserve_committed_assignment: true
+    app_reconcile_migration_volume_roots: true
+    app_reconcile_targeted_firewall: true
+  tasks:
+    - name: Stage and validate the final runtime without starting it
+      when: migration_phase | default('all') in ['prepare', 'all']
+      block:
+        - ansible.builtin.import_role:
+            name: apps
+            tasks_from: prepare
+        - ansible.builtin.import_role:
+            name: apps
+            tasks_from: stage
+        - ansible.builtin.import_role:
+            name: apps
+            tasks_from: validate
+        - ansible.builtin.include_role:
+            name: app_host_migration
+            tasks_from: stage_target
+        - ansible.builtin.import_role:
+            name: apps
+            tasks_from: finalize
+        - name: Install the normal target route with an unopened final-copy gate
+          ansible.builtin.include_role:
+            name: app_host_migration
+            tasks_from: route
+          vars:
+            migration_route: target-gate
+        - name: Inspect persistent target masks after staging
+          ansible.builtin.stat:
+            path: "{{ podman_home }}/.config/systemd/user/{{ item }}"
+            follow: false
+          loop: "{{ migration_service_names }}"
+          register: migration_persistent_masks
+        - name: Require persistent masks without rebooting the host
+          ansible.builtin.assert:
+            that:
+              - item.stat.islnk | default(false)
+              - item.stat.lnk_source | default('') == '/dev/null'
+          loop: "{{ migration_persistent_masks.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+- name: Verify target TLS before any downtime
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: tls
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover', 'handoff']
+
+- name: Refresh checksums while the source still serves traffic
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: transfer
+      vars:
+        migration_final_copy: false
+        migration_checksum_copy: true
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+
+- name: Record preparation and require cutover approval
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: save
+      vars:
+        migration_update:
+          prepared: true
+      when: migration_phase | default('all') in ['prepare', 'all', 'cutover']
+    - name: Require explicit downtime and target pruning approval
+      ansible.builtin.assert:
+        that:
+          - migration_confirm_cutover | bool
+          - migration_approve_target_prune | bool
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Switch source to the bounded holding proxy
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: route
+      vars:
+        migration_route: proxy
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Stop and persistently fence source writers
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Stop and mask all selected source services together
+      ansible.builtin.command:
+        argv: "{{ ['systemctl', '--user', 'mask', '--now'] + migration_service_names }}"
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: true
+      when:
+        - migration_phase | default('all') in ['all', 'cutover']
+        - migration_service_names | length > 0
+    - ansible.builtin.set_fact:
+        migration_fenced: true
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Prove both hosts frozen and revalidate mounts
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify frozen writers, drained connections and clean database shutdown
+      ansible.builtin.command:
+        argv: "{{ migration_frozen_argv }}"
+      changed_when: false
+      when:
+        - migration_phase | default('all') in ['all', 'cutover']
+        - migration_frozen_argv | length > 0
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: paths
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Final consistent transfer
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: transfer
+      vars:
+        migration_final_copy: true
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Commit data-authority barrier before any target activation
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify optional application-specific offline data after final copy
+      ansible.builtin.command:
+        argv: "{{ migration_frozen_argv }}"
+      changed_when: false
+      when:
+        - migration_phase | default('all') in ['all', 'cutover']
+        - migration_frozen_argv | length > 0
+    - name: Persist activation attempted on BOTH hosts before unmasking either
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: save
+      vars:
+        migration_update:
+          final_copy_verified: true
+          target_activation_attempted: true
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Activate and verify sole target writer
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    target_app: "{{ migration_app }}"
+    app_model_assigned_apps: "{{ ((assigned_apps | default([])) + (migration_overlay_apps | default([])) + [migration_app]) | unique | list }}"
+    app_model_desired_states: "{{ (app_desired_states | default({})) | combine({migration_app: 'running'}) }}"
+    app_model_allow_uncommitted_assignment: true
+    app_model_preserve_committed_assignment: true
+    app_reconcile_migration_volume_roots: true
+    app_reconcile_targeted_firewall: true
+  tasks:
+    - name: Enable and start only the already-staged target runtime
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: start_target
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Read target site produced by ordinary running deployment
+      ansible.builtin.slurp:
+        src: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+      register: migration_deployed_target_site
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Require ordinary deploy to have replaced migration maintenance
+      ansible.builtin.assert:
+        that:
+          - "'Application migration in progress' not in (migration_deployed_target_site.content | b64decode)"
+          - "'Inactive application: no public routes' not in (migration_deployed_target_site.content | b64decode)"
+        fail_msg: "Ordinary running deployment left a migration/inactive target site on disk."
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Run optional application-specific target data verification
+      ansible.builtin.command:
+        argv: "{{ migration_healthy_argv }}"
+      changed_when: false
+      when:
+        - migration_phase | default('all') in ['all', 'cutover', 'handoff']
+        - migration_healthy_argv | length > 0
+    # The ordinary apps role above owns every running-state responsibility:
+    # Quadlets, masks, secrets, services, Caddy networks, sites, firewall and reloads.
+    # Migration adds only generic live-binding and external acceptance checks.
+    - name: Verify declared live TCP and UDP mappings on target
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: verify_published_ports
+      when:
+        - migration_phase | default('all') in ['all', 'cutover', 'handoff']
+        - migration_published_ports | length > 0
+    - name: Verify declared target TCP ports from controller
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: check_tcp
+      when:
+        - migration_phase | default('all') in ['all', 'cutover', 'handoff']
+        - migration_published_ports | length > 0
+    - name: Verify target application HTTPS from controller before source promotion
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: check_https
+      vars:
+        migration_check_addresses:
+          - "{{ migration_target_address }}"
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+
+- name: Forward old traffic without ever restarting source
+  hosts: "{{ source_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run optional source handoff verification
+      ansible.builtin.command:
+        argv: "{{ migration_frozen_argv }}"
+      changed_when: false
+      when:
+        - migration_phase | default('all') in ['all', 'cutover', 'handoff']
+        - migration_frozen_argv | length > 0
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: route
+      vars:
+        migration_route: proxy
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Verify each old-host HTTPS route reaches the target
+      ansible.builtin.command:
+        argv: [curl, --silent, --show-error, --noproxy, '*', --connect-timeout, '10', --max-time, '30', --resolve, "{{ item }}:443:127.0.0.1", --output, /dev/null, "https://{{ item }}/"]
+      loop: "{{ migration_model.domains }}"
+      register: migration_source_proxy_https
+      changed_when: false
+      failed_when: false
+      until: migration_source_proxy_https.rc == 0
+      retries: 30
+      delay: 3
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Verify target and old-host proxy HTTPS from controller
+      ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: check_https
+      vars:
+        migration_check_addresses:
+          - "{{ migration_target_address }}"
+          - "{{ hostvars[source_host].ansible_host }}"
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+    - name: Explain remaining operator ownership transition
+      ansible.builtin.debug:
+        msg: >-
+          Keep ordinary deployment suspended on BOTH hosts. Move assigned_apps
+          only after verifying old/new IPv4/IPv6 routes and app operations; update
+          DNS manually. Retain source masks, data and proxy until DNS drain and
+          explicit ownership reconciliation. No automatic rollback or data deletion.
+      when: migration_phase | default('all') in ['all', 'cutover', 'handoff']
+
+- name: Remove temporary migration transfer credentials
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  tasks:
+    - ansible.builtin.include_role:
+        name: app_host_migration
+        tasks_from: remove_transfer
+      when: migration_phase | default('all') in ['all', 'cutover']
+
+- name: Reconcile final inventory ownership after DNS drain
+  hosts: "{{ source_host }},{{ target_host }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run optional DNS drain and endpoint retirement verification
+      ansible.builtin.command:
+        argv: "{{ migration_cleanup_argv }}"
+      changed_when: false
+      when:
+        - migration_phase | default('all') == 'cleanup'
+        - migration_cleanup_argv | length > 0
+    - name: Require explicit old endpoint retirement approval
+      ansible.builtin.assert:
+        that:
+          - migration_confirm_endpoint_retirement | bool
+      when: migration_phase | default('all') == 'cleanup'
+    - name: Reconcile ordinary runtime ownership from final inventory
+      ansible.builtin.include_role:
+        name: apps
+      when: migration_phase | default('all') == 'cleanup'
+    - name: Remove completed record but retain source data and persistent masks
+      ansible.builtin.file:
+        path: "{{ migration_state_path }}"
+        state: absent
+      when: migration_phase | default('all') == 'cleanup'

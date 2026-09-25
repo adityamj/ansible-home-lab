@@ -1,0 +1,277 @@
+---
+- name: Upload rendered artifacts over the existing Ansible connection
+  ansible.builtin.include_tasks: copy_managed_directory.yml
+  vars:
+    directory_sync_src: "{{ app_artifact_local_dir }}"
+    directory_sync_dest: "{{ app_artifact_remote_dir }}"
+    directory_sync_directories: "{{ app_apply_plan.artifact_directories }}"
+    directory_sync_files: "{{ app_apply_plan.artifact_files }}"
+    directory_sync_owner: root
+    directory_sync_group: "{{ podman_group }}"
+    directory_sync_directory_mode: '0750'
+    directory_sync_file_mode: '0640'
+    directory_sync_track_runtime: false
+
+- name: Inspect managed pasta unit destinations
+  ansible.builtin.stat:
+    path: "{{ podman_user_unit_dir }}/{{ unit_file }}"
+    follow: false
+  loop: "{{ app_apply_plan.units }}"
+  loop_control:
+    loop_var: unit_file
+    label: "{{ unit_file }}"
+  register: app_pasta_unit_destinations
+
+- name: Require safe managed pasta unit destinations
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not unit_state.stat.exists or unit_state.stat.isreg
+      - not unit_state.stat.exists or not unit_state.stat.islnk
+      - not unit_state.stat.exists or unit_state.stat.uid == 0
+    fail_msg: "A managed pasta unit destination is unsafe."
+  loop: "{{ app_pasta_unit_destinations.results | default([]) }}"
+  loop_control:
+    loop_var: unit_state
+    label: "{{ unit_state.unit_file }}"
+
+- name: Verify live storage before inactive image preparation
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+  when: app_apply_plan.inactive_images | length > 0
+
+- name: Validate externally prepared immutable image declarations
+  ansible.builtin.assert:
+    that:
+      - app_prepared_image_digests is mapping
+      - app_prepared_image_digests | dict2items | map(attribute='key') | list | difference(app_apply_plan.deploy_images) | length == 0
+      - app_prepared_image_digests | dict2items | map(attribute='value') | select('match', '^.+@sha256:[0-9a-f]{64}$') | list | length == app_prepared_image_digests | length
+    fail_msg: >-
+      Prepared image tags {{ app_prepared_image_digests | dict2items | map(attribute='key') | list }}
+      are not a subset of selected plan images {{ app_apply_plan.deploy_images }}.
+  when: app_prepared_image_digests | default({}) | length > 0
+
+- name: Prepare unpinned images for inactive applications without creating containers
+  containers.podman.podman_image:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ app_apply_plan.inactive_images | difference((app_prepared_image_digests | default({})).keys() | list) }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+
+- name: Reverify prepared image tag and digest identities without pulling tags
+  ansible.builtin.command:
+    argv: [podman, image, inspect, "{{ item.key }}", "{{ item.value }}"]
+  loop: "{{ (app_prepared_image_digests | default({})) | dict2items }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: app_prepared_image_observations
+  changed_when: false
+
+- name: Require prepared image tags to remain pinned locally
+  ansible.builtin.assert:
+    that:
+      - item.stdout | from_json | map(attribute='Id') | unique | length == 1
+  loop: "{{ app_prepared_image_observations.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+
+# Rendering, transfer and image pulls may take time. Reobserve mounts immediately
+# before creating volumes or synchronizing configuration.
+- name: Reverify live storage before application data writes
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Inspect declared static directories
+  ansible.builtin.stat:
+    path: "{{ static_dir }}"
+    follow: false
+  loop: "{{ app_apply_plan.static_dirs | default([]) }}"
+  loop_control:
+    loop_var: static_dir
+    label: "{{ static_dir }}"
+  register: app_static_dir_stats
+
+- name: Require safe declared static directories
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - static_state.static_dir.startswith(static_base_path + '/')
+      - not static_state.stat.exists or static_state.stat.isdir
+      - not static_state.stat.exists or not static_state.stat.islnk
+    fail_msg: "A declared static directory is unsafe."
+  loop: "{{ app_static_dir_stats.results | default([]) }}"
+  loop_control:
+    loop_var: static_state
+    label: "{{ static_state.static_dir }}"
+
+- name: Reconcile declared static directory roots
+  ansible.builtin.file:
+    path: "{{ static_dir }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '2775'
+  loop: "{{ app_apply_plan.static_dirs | default([]) }}"
+  loop_control:
+    loop_var: static_dir
+    label: "{{ static_dir }}"
+
+- name: Inspect application volume directories
+  ansible.builtin.stat:
+    path: "{{ volume_dir.path }}"
+    follow: false
+  loop: "{{ app_apply_plan.volume_dirs }}"
+  loop_control:
+    loop_var: volume_dir
+    label: "{{ volume_dir.path }}"
+  register: app_volume_dir_stats
+
+- name: Require safe application volume roots
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - volume_state.volume_dir.path.startswith(app_data_base_path + '/')
+      - not volume_state.stat.exists or volume_state.stat.isdir
+      - not volume_state.stat.exists or not volume_state.stat.islnk
+    fail_msg: "A writable application volume root is unsafe."
+  loop: "{{ app_volume_dir_stats.results | default([]) }}"
+  loop_control:
+    loop_var: volume_state
+    label: "{{ volume_state.volume_dir.path }}"
+
+- name: Stop selected migration services before root metadata repair
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    scope: user
+  loop: "{{ app_apply_plan.running_services }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  when: app_reconcile_migration_volume_roots | bool
+
+- name: Reconcile migration-created app parent inodes without touching contents
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: '0750'
+  loop:
+    - "{{ app_data_base_path }}/{{ target_app }}"
+    - "{{ app_data_base_path }}/{{ target_app }}/volumes"
+  when: app_reconcile_migration_volume_roots | bool
+
+- name: Reconcile migration-created volume root inode from source metadata
+  ansible.builtin.file:
+    path: "{{ volume_dir.path }}"
+    state: directory
+    owner: "{{ migration_source_volume_root.stat.uid }}"
+    group: "{{ migration_source_volume_root.stat.gid }}"
+    mode: "{{ migration_source_volume_root.stat.mode }}"
+  loop: "{{ app_apply_plan.volume_dirs }}"
+  loop_control:
+    loop_var: volume_dir
+    label: "{{ volume_dir.path }}"
+  vars:
+    migration_source_volume_root: >-
+      {{ hostvars[source_host].migration_roots.results
+         | selectattr('item', 'equalto', volume_dir.path | basename) | first }}
+  when: app_reconcile_migration_volume_roots | bool
+
+- name: Discover interrupted volume initialization
+  ansible.builtin.find:
+    paths: "{{ apps_control_state_dir }}"
+    patterns: 'volume-init-*'
+    file_type: file
+  register: pending_volume_initializations
+
+- name: Initialize only new or interrupted empty volume roots
+  ansible.builtin.include_tasks: initialize_volume.yml
+  loop: "{{ app_volume_dir_stats.results }}"
+  loop_control:
+    loop_var: volume_state
+    label: "{{ volume_state.volume_dir.path }}"
+  vars:
+    volume_init_marker: "{{ apps_control_state_dir }}/volume-init-{{ volume_state.volume_dir.path | hash('sha256') }}"
+  when: >-
+    not volume_state.stat.exists
+    or volume_init_marker in (pending_volume_initializations.files | map(attribute='path') | list)
+
+- name: Ensure managed configuration parent directories exist
+  ansible.builtin.file:
+    path: "{{ mount.dest | dirname }}"
+    state: directory
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "0755"
+  loop: "{{ app_apply_plan.mounts }}"
+  loop_control:
+    loop_var: mount
+    label: "{{ mount.dest | dirname }}"
+  become: true
+
+- name: Initialize managed configuration directory change tracker
+  ansible.builtin.set_fact:
+    managed_config_dirs_changed: false
+
+- name: Copy managed configuration directories over the existing Ansible connection
+  ansible.builtin.include_tasks: copy_managed_directory.yml
+  vars:
+    directory_sync_src: "{{ mount.src }}"
+    directory_sync_dest: "{{ mount.dest }}"
+    directory_sync_directories: "{{ mount.directories }}"
+    directory_sync_files: "{{ mount.files }}"
+    directory_sync_owner: "{{ podman_user }}"
+    directory_sync_group: "{{ podman_group }}"
+    directory_sync_directory_mode: "{{ mount.directory_mode }}"
+    directory_sync_file_mode: "{{ mount.file_mode }}"
+    directory_sync_track_runtime: true
+  loop: "{{ app_apply_plan.mounts | selectattr('source_kind', 'equalto', 'directory') | list }}"
+  loop_control:
+    loop_var: mount
+    label: "{{ mount.dest }}"
+
+- name: Copy managed configuration files
+  ansible.builtin.copy:
+    src: "{{ mount.src }}"
+    dest: "{{ mount.dest }}"
+    owner: "{{ podman_user }}"
+    group: "{{ podman_group }}"
+    mode: "{{ mount.file_mode }}"
+  loop: "{{ app_apply_plan.mounts | selectattr('source_kind', 'equalto', 'file') | list }}"
+  loop_control:
+    loop_var: mount
+    label: "{{ mount.dest }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  register: copied_managed_config_files
+
+- name: Validate secret declarations have vaulted values
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - vault_podman_secrets is defined
+      - vault_podman_secrets[app_secret.app] is defined
+      - vault_podman_secrets[app_secret.app][app_secret.logical_name] is defined
+      - vault_secret_hash_pepper is defined
+      - vault_secret_hash_pepper | string | length > 0
+    fail_msg: "A declared Podman secret value or hash pepper is missing from vaulted variables."
+  loop: "{{ app_apply_plan.secrets }}"
+  loop_control:
+    loop_var: app_secret
+    label: "{{ app_secret.physical_name }}"
+  no_log: true
+
+- name: Initialize secret change tracker
+  ansible.builtin.set_fact:
+    app_secrets_changed: false
+
+- name: Reconcile Podman secrets
+  ansible.builtin.include_tasks: reconcile_secret.yml
+  loop: "{{ app_apply_plan.secrets }}"
+  loop_control:
+    loop_var: app_secret
+    label: "{{ app_secret.physical_name }}"
+  no_log: true

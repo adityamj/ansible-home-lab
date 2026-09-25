@@ -1,0 +1,11 @@
+---
+- name: Migrate application volume layout
+  hosts: app_hosts
+  become: true
+  gather_facts: false
+
+  vars:
+    target_app: "{{ app | default('') | string | trim }}"
+
+  roles:
+    - volume_layout_migration

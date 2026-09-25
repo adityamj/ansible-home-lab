@@ -1,0 +1,79 @@
+---
+# Remove every native mask in one systemd invocation. Quadlet-generated units
+# cannot be enabled conventionally; their [Install] metadata generates the boot
+# activation links when the manager reloads.
+- name: Unmask all prestaged target application services together
+  ansible.builtin.command:
+    argv: "{{ ['systemctl', '--user', 'unmask'] + migration_service_names }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+  when: migration_service_names | length > 0
+
+- name: Reload rootless systemd once after removing all masks
+  ansible.builtin.systemd:
+    daemon_reload: true
+    scope: user
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false
+
+- name: Start all prestaged target application networks together
+  ansible.builtin.command:
+    argv: "{{ ['systemctl', '--user', 'start'] + migration_network_service_names }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+  when: migration_network_service_names | length > 0
+
+- name: Inspect target Caddy network attachments
+  containers.podman.podman_container_info:
+    name: caddy
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_target_caddy
+
+- name: Attach target Caddy to prestaged application networks
+  ansible.builtin.command:
+    argv: [podman, network, connect, "{{ item }}", caddy]
+  loop: >-
+    {{ migration_caddy_network_names
+       | difference((migration_target_caddy.containers[0].NetworkSettings.Networks | default({})).keys() | list) }}
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+
+- name: Start all prestaged target application services together
+  ansible.builtin.command:
+    argv: "{{ ['systemctl', '--user', 'start'] + migration_service_names }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: true
+  when: migration_service_names | length > 0
+
+- name: Wait for prestaged target containers to become healthy
+  containers.podman.podman_container_info: {}
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_target_runtime
+  changed_when: false
+  until: >-
+    {%- set selected = migration_target_runtime.containers | default([])
+       | selectattr('Name', 'in', migration_model.containers | map(attribute='physical_name') | list) | list -%}
+    {%- set readiness = namespace(ok=selected | length == migration_model.containers | length) -%}
+    {%- for container in selected -%}
+    {%- if not container.State.Running | default(false)
+       or container.State.Health.Status | default('healthy') != 'healthy' -%}
+    {%- set readiness.ok = false -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {{ readiness.ok }}
+  retries: 30
+  delay: 2

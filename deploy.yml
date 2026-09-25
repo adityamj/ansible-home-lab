@@ -1,11 +1,11 @@
 ---
 - name: Deploy applications
-  hosts: homelab_servers
+  hosts: app_hosts
   become: true
   gather_facts: false
 
   vars:
-    target_app: "{{ app | default('') }}"  # Optional: limit to single app
+    target_app: "{{ app | default('') | string | trim }}"
 
   roles:
     - apps

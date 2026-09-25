@@ -1,0 +1,8 @@
+---
+# Bootstrap/platform updates own service wiring and package policy. App deploys
+# reconcile only the managed rules and verify their live state.
+managed_firewall_manage_platform: true
+managed_firewall_force_refresh: false
+managed_firewall_app_ports: []
+managed_firewall_preserve_existing: false
+managed_firewall_remove_unsupported_managers: false

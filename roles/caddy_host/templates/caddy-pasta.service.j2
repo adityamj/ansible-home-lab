@@ -1,0 +1,14 @@
+[Unit]
+Description=Source-preserving pasta ingress for Caddy
+Requires=caddy.service
+After=caddy.service
+BindsTo=caddy.service
+PartOf=caddy.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/pasta-for-container caddy --foreground --config-net --ns-ifname pasta0 --tcp-ports 80,443 --udp-ports 443
+Restart=on-failure
+RestartSec=2s
+MemoryMax=64M
+TasksMax=64

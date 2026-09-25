@@ -1,0 +1,104 @@
+---
+- name: Block ordinary deployment on hosts with declared migration intent
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        app_migration_execution | default(false) | bool
+        or ((outgoing_migrations | default({}) | length == 0)
+            and (incoming_migrations | default({}) | length == 0))
+    fail_msg: >-
+      This host has paired migration intent. Ordinary deployment is suspended so
+      it cannot start a source writer, activate a target, or remove staged state.
+      Continue with migrate_app_host.yml or remove intent only after handoff.
+
+- name: Discover active migration safety records
+  ansible.builtin.find:
+    paths: "{{ apps_control_state_dir }}/migrations"
+    patterns: '*.json'
+    file_type: file
+    recurse: false
+  register: app_deploy_migration_record_files
+  failed_when: false
+
+- name: Read active migration safety records
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ app_deploy_migration_record_files.files | default([]) }}"
+  register: app_deploy_migration_records_raw
+
+- name: Prevent deployment from reviving a handed-off source writer
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        app_migration_execution | default(false) | bool
+        or not (migration_record.source_host | default('') == inventory_hostname
+                and migration_record.target_activation_attempted | default(false) | bool
+                and migration_record.app | default('') in (assigned_apps | default([])))
+    fail_msg: >-
+      Refusing to deploy {{ migration_record.app | default('unknown') }} as assigned on its
+      source after target activation. Commit target ownership/draining inventory first.
+  vars:
+    migration_record: "{{ item.content | b64decode | from_json }}"
+  loop: "{{ app_deploy_migration_records_raw.results | default([]) }}"
+  loop_control:
+    label: "{{ migration_record.app | default('invalid') }}"
+
+- name: Validate caller refresh preference
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - force_refresh is boolean
+    fail_msg: 'Pass a boolean, for example: -e ''{"force_refresh": true}''.'
+
+- name: Validate persistent storage settings
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/validate_storage.yml"
+
+- name: Validate deployment storage paths
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - caddy_config_dir == data_mount + '/system/ingress/caddy/config'
+      - apps_control_state_dir == '/var/lib/ansible-app-host'
+      - podman_user_unit_dir == '/etc/systemd/user'
+    fail_msg: "Deployment paths must use the platform-owned derived locations."
+
+- name: Load rootless account identity for deployment
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_facts.yml"
+
+# The user manager is activated only after the plan's inactive masks are installed.
+- name: Verify persistent storage before deployment preparation
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Inspect required platform baseline
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ caddy_config_dir }}/Caddyfile"
+    - /etc/nftables.conf
+    - /usr/local/libexec/ansible-storage-ready
+    - /usr/local/libexec/pasta-for-container
+    - /usr/bin/pasta
+  register: platform_baseline
+
+- name: Require prepared platform before app deployment
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stat.isreg | default(false)
+      - not item.stat.islnk | default(false)
+      - item.stat.uid | default(-1) == 0
+    fail_msg: "Platform baseline is missing or unsafe. Run bootstrap.yml or update_platform.yml first."
+  loop: "{{ platform_baseline.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Set deployment paths
+  ansible.builtin.set_fact:
+    app_artifact_local_dir: "{{ lookup('env', 'TMPDIR') | default('/tmp', true) }}/ansible-app-artifacts/{{ inventory_hostname }}"
+    app_artifact_remote_dir: "{{ apps_control_state_dir }}/artifacts"
+    app_caddy_validation_dir: "{{ apps_control_state_dir }}/caddy-validation"
+    app_artifact_previous_path: "{{ apps_control_state_dir }}/host-state.json"
+    secret_hash_dir: "{{ apps_control_state_dir }}/secret-hashes"

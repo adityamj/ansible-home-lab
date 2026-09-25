@@ -1,0 +1,88 @@
+---
+# Mirror the effective flat *.caddy import set, choosing selected artifacts before
+# copying. Do not first copy live selected sites and then overwrite them: that
+# would make retries oscillate when the candidate differs from the live site.
+- name: Require canonical Caddy validation workspace
+  ansible.builtin.command:
+    argv: [realpath, -m, "{{ app_caddy_validation_dir }}"]
+  register: caddy_validation_canonical
+  changed_when: false
+  failed_when: caddy_validation_canonical.rc != 0 or caddy_validation_canonical.stdout != app_caddy_validation_dir
+
+- name: Inventory active Caddy site imports
+  ansible.builtin.find:
+    paths: "{{ caddy_config_dir }}/sites-enabled"
+    patterns: '*.caddy'
+    file_type: any
+    hidden: true
+    follow: false
+    recurse: false
+  register: caddy_validation_live_sites
+  failed_when: caddy_validation_live_sites.skipped_paths | default({}) | length > 0
+
+- name: Require regular active Caddy site imports
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.isreg
+    fail_msg: "Caddy site imports must be regular files, not directories or links."
+  loop: "{{ caddy_validation_live_sites.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Select effective Caddy validation site names
+  ansible.builtin.set_fact:
+    caddy_validation_site_names: >-
+      {{ ((caddy_validation_live_sites.files | map(attribute='path') | map('basename') | list)
+          + app_apply_plan.caddy_sites) | unique | sort }}
+
+- name: Ensure Caddy validation workspace root
+  ansible.builtin.file:
+    path: "{{ app_caddy_validation_dir }}"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0750'
+
+- name: Inventory previous Caddy validation workspace
+  ansible.builtin.find:
+    paths: "{{ app_caddy_validation_dir }}"
+    recurse: true
+    hidden: true
+    follow: false
+    file_type: any
+  register: caddy_validation_existing
+
+- name: Remove obsolete or incompatible Caddy validation entries
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: absent
+  loop: "{{ caddy_validation_existing.files | sort(attribute='path', reverse=true) }}"
+  loop_control:
+    label: "{{ item.path }}"
+  vars:
+    desired_files: "{{ caddy_validation_site_names | map('regex_replace', '^', app_caddy_validation_dir ~ '/sites-enabled/') | list }}"
+  when: >-
+    not (item.isdir and item.path == app_caddy_validation_dir ~ '/sites-enabled')
+    and not (item.isreg and item.nlink == 1 and item.path in desired_files)
+
+- name: Ensure Caddy validation sites directory
+  ansible.builtin.file:
+    path: "{{ app_caddy_validation_dir }}/sites-enabled"
+    state: directory
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0750'
+
+- name: Stage effective Caddy validation sites
+  ansible.builtin.copy:
+    src: "{{ (app_artifact_remote_dir ~ '/caddy' if item in app_apply_plan.caddy_sites else caddy_config_dir) }}/sites-enabled/{{ item }}"
+    dest: "{{ app_caddy_validation_dir }}/sites-enabled/{{ item }}"
+    remote_src: true
+    owner: root
+    group: "{{ podman_group }}"
+    mode: '0644'
+    follow: false
+  loop: "{{ caddy_validation_site_names }}"
+  loop_control:
+    label: "{{ item }}"

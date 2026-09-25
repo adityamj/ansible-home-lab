@@ -1,0 +1,76 @@
+---
+# Used before cutover (legacy or stable) and after deployment (stable only).
+# Always reread disk: an earlier observation cannot prove safe network retirement.
+- name: Inventory current Caddy network drop-ins
+  ansible.builtin.find:
+    paths: "{{ podman_quadlet_dir }}/caddy.container.d"
+    patterns: '*.conf'
+    file_type: any
+    hidden: true
+  register: migration_current_caddy_dropins
+
+- name: Require all desired Caddy drop-ins before network retirement
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - podman_quadlet_dir ~ '/caddy.container.d/50-network-' ~ item.name ~ '.conf' in (migration_current_caddy_dropins.files | map(attribute='path') | list)
+    fail_msg: "Missing stable Caddy drop-in for {{ item.name }}; legacy networks will not be retired."
+  loop: "{{ migration_plan.host_apps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - not (migration_allow_legacy_caddy_networks | default(false) | bool)
+    - item.networks | default([]) | selectattr('caddy', 'defined') | selectattr('caddy') | list | length > 0
+
+- name: Require regular administrator-owned Caddy drop-ins
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.isreg | default(false)
+      - item.uid == 0
+      - item.gid == 0
+      - item.mode in ['0600', '0640', '0644']
+    fail_msg: "Unsafe Caddy drop-in: {{ item.path }}"
+  loop: "{{ migration_current_caddy_dropins.files }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Read current Caddy network drop-ins
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ migration_current_caddy_dropins.files }}"
+  register: migration_caddy_dropins
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Require app-matched Caddy network references for this migration phase
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - matching_apps | length == 1
+      - item.item.path == podman_quadlet_dir ~ '/caddy.container.d/50-network-' ~ dropin_app ~ '.conf'
+      - >-
+        ((matching_apps | first).desired_state | default('running') == 'running'
+         and executable_lines == desired_lines and desired_lines | length > 1)
+        or ((matching_apps | first).desired_state | default('running') == 'inactive'
+            and executable_lines | length == 0)
+        or (migration_allow_legacy_caddy_networks | default(false) | bool
+            and executable_lines == legacy_lines)
+    fail_msg: >-
+      Unsupported Caddy drop-in {{ item.item.path }}. Before cutover only its own
+      exact legacy ingress reference or desired stable references are accepted;
+      before network retirement only desired stable references are accepted.
+  vars:
+    dropin_app: "{{ item.item.path | basename | regex_replace('^50-network-', '') | regex_replace('[.]conf$', '') }}"
+    matching_apps: "{{ migration_plan.host_apps | selectattr('name', 'equalto', dropin_app) | list }}"
+    executable_lines: >-
+      {{ (item.content | b64decode).splitlines() | map('trim')
+         | reject('match', '^(#|;|$)') | list }}
+    desired_lines: >-
+      {{ ['[Container]'] + ((matching_apps | first).networks | default([])
+         | selectattr('caddy', 'defined') | selectattr('caddy')
+         | map(attribute='quadlet_name') | map('regex_replace', '^', 'Network=') | list) }}
+    legacy_lines: "{{ ['[Container]', 'Network=' ~ dropin_app ~ '-ingress.network'] }}"
+  loop: "{{ migration_caddy_dropins.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"

@@ -1,169 +1,105 @@
 ---
-- name: Ensure apps_root is provided
+- name: Build globally visible application topology
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/inventory_topology.yml"
+
+- name: Validate application compiler settings
   ansible.builtin.assert:
+    quiet: true
     that:
       - apps_root is defined
       - apps_root is string
       - apps_root | trim | length > 0
-    fail_msg: >-
-      apps_root is required and must point to the apps directory on the controller
-      (for example: /path/to/control-repo/apps).
-  delegate_to: localhost
-  become: false
-  run_once: true
+      - apps_root.startswith('/')
+      - ssh_port is defined
+      - app_model_compiler_path is defined
+      - app_model_compiler_path.startswith('/')
+    fail_msg: "Application compiler paths and ssh_port must be configured."
 
-- name: Set canonical app sources root
-  ansible.builtin.set_fact:
-    app_sources_root: "{{ apps_root | trim }}"
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Ensure apps_root exists and is a directory
+- name: Inspect application compiler inputs
   ansible.builtin.stat:
-    path: "{{ app_sources_root }}"
-  register: apps_root_stat
+    path: "{{ item }}"
+  loop:
+    - "{{ apps_root }}"
+    - "{{ app_model_compiler_path }}"
+  register: app_compiler_inputs
   delegate_to: localhost
   become: false
-  run_once: true
 
-- name: Validate apps_root directory
+- name: Require application compiler inputs
   ansible.builtin.assert:
+    quiet: true
     that:
-      - apps_root_stat.stat.exists
-      - apps_root_stat.stat.isdir
-    fail_msg: >-
-      apps_root '{{ app_sources_root }}' must exist and be a directory on the controller.
+      - app_compiler_inputs.results[0].stat.isdir | default(false)
+      - app_compiler_inputs.results[1].stat.isreg | default(false)
+    fail_msg: "The application source directory or model compiler is missing."
+
+- name: Compile application model for this host
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ app_model_compiler_path }}"
+      - --apps-root
+      - "{{ apps_root }}"
+    stdin: >-
+      {{ {
+          'assigned_apps': app_model_assigned_apps | default(assigned_apps | default([])),
+          'target_app': target_app | default(''),
+          'ssh_port': ssh_port,
+          'caddy_platform_network': caddy_platform_network | default('caddy-egress-net'),
+          'app_desired_states': app_model_desired_states | default(app_desired_states | default({})),
+          'draining_apps': draining_apps | default({}),
+          'inventory_hosts': app_inventory_topology,
+          'current_host': inventory_hostname,
+          'selected_hosts': ansible_play_hosts_all | default([]),
+          'defaults': {
+            'memory_max': app_memory_default,
+            'pids_limit': app_pids_limit_default,
+            'restart_policy': app_restart_policy,
+            'restart_sec': app_restart_sec,
+            'healthcheck': app_healthcheck_defaults,
+            'runtime_healthcheck': app_runtime_healthcheck_defaults
+          }
+        } | to_json }}
+    stdin_add_newline: true
+  register: compiled_app_model_command
   delegate_to: localhost
   become: false
-  run_once: true
+  check_mode: false
+  changed_when: false
 
-- name: Find app definition files
-  ansible.builtin.find:
-    paths: "{{ app_sources_root }}"
-    file_type: file
-    patterns:
-      - app.yml
-    recurse: true
-    depth: 2
-  register: apps_find_results
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Collect app directory paths
+- name: Parse compiled application model
   ansible.builtin.set_fact:
-    apps_dirs: "{{ apps_find_results.files | map(attribute='path') | map('dirname') | unique | sort | list }}"
-  delegate_to: localhost
-  become: false
-  run_once: true
+    compiled_app_model: "{{ compiled_app_model_command.stdout | from_json }}"
 
-- name: Build apps list from app directories
-  ansible.builtin.set_fact:
-    apps_list: >-
-      {%- set items = [] -%}
-      {%- for app_dir in apps_dirs | default([]) -%}
-      {%-   set app_name = app_dir | basename -%}
-      {%-   set app_path = app_dir + '/app.yml' -%}
-      {%-   set app_data = lookup('ansible.builtin.file', app_path) | from_yaml -%}
-      {%-   set app_json = app_data | to_json -%}
-      {%-   set app_json = app_json | replace('{{ app_name }}', app_name) -%}
-      {%-   set app_json = app_json | replace('{{ data_mount }}', data_mount) -%}
-      {%-   set app_json = app_json | replace('{{ static_base_path }}', static_base_path) -%}
-      {%-   set app_data = app_json | from_json -%}
-      {%-   set app_final = app_data
-            | combine(
-                {
-                  'name': app_name
-                },
-                recursive=True
-              )
-        -%}
-      {%-   set _ = items.append(app_final) -%}
-      {%- endfor -%}
-      {{ items | sort(attribute='name') }}
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Resolve assigned apps for this host
-  ansible.builtin.set_fact:
-    assigned_apps: "{{ hostvars[inventory_hostname].assigned_apps | default([]) }}"
-
-- name: Validate assigned apps exist
+- name: Require supported application model plan
   ansible.builtin.assert:
+    quiet: true
     that:
-      - assigned_apps | difference(apps_list | map(attribute='name') | list) | length == 0
-    fail_msg: "One or more assigned_apps are missing from app definitions."
-  when: assigned_apps | length > 0
-  delegate_to: localhost
-  become: false
-  run_once: true
+      - compiled_app_model is mapping
+      - compiled_app_model.version == 3
+      - compiled_app_model.naming_scheme == 'dash-escape-kind-v1'
+    fail_msg: "The application compiler returned an unsupported plan."
 
-- name: Select apps assigned to this host
+- name: Publish compiled application model facts
   ansible.builtin.set_fact:
-    host_apps: "{{ apps_list | selectattr('name', 'in', assigned_apps) | list }}"
-  when: assigned_apps | length > 0
-
-- name: Set empty app list when no assignments
-  ansible.builtin.set_fact:
-    host_apps: []
-  when: assigned_apps | length == 0
-
-- name: Ensure app names are unique
-  ansible.builtin.assert:
-    that:
-      - (apps_list | map(attribute='name') | list | length) == (apps_list | map(attribute='name') | unique | list | length)
-    fail_msg: "Duplicate app names detected across app definitions."
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Ensure domains are unique across apps
-  ansible.builtin.set_fact:
-    all_domains: >-
-      {%- set items = [] -%}
-      {%- for app in apps_list -%}
-      {%-   set app_domains = app.domains | default([]) -%}
-      {%-   if (app_domains | length) == 0 and app.ingress is defined and app.ingress.main_domain is defined -%}
-      {%-     set app_domains = [app.ingress.main_domain] -%}
-      {%-   endif -%}
-      {%-   set _ = items.extend(app_domains) -%}
-      {%- endfor -%}
-      {{ items }}
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Ensure domains are unique
-  ansible.builtin.assert:
-    that:
-      - all_domains | length == (all_domains | unique | length)
-    fail_msg: "Duplicate domain detected across app definitions."
-  delegate_to: localhost
-  become: false
-  run_once: true
-
-- name: Collect ingress networks for host apps
-  ansible.builtin.set_fact:
-    host_ingress_networks: []
-  when: (host_apps | length) > 0
-
-- name: Build ingress networks list
-  ansible.builtin.set_fact:
-    host_ingress_networks: >-
-      {{
-        host_ingress_networks
-        + [ (item.pod | default({})).ingress_network | default(item.name + '-ingress-net') ]
-      }}
-  loop: "{{ host_apps }}"
-  loop_control:
-    loop_var: item
-  when:
-    - (host_apps | length) > 0
-    - (item.containers | default([]) | length) > 0
-
-- name: Normalize ingress networks list
-  ansible.builtin.set_fact:
-    host_ingress_networks: "{{ host_ingress_networks | unique | sort }}"
-  when: (host_apps | length) > 0
+    app_sources_root: "{{ compiled_app_model.app_sources_root }}"
+    apps_list: "{{ compiled_app_model.apps_list }}"
+    host_assigned_app_names: "{{ compiled_app_model.host_assigned_app_names }}"
+    host_assigned_apps_digest: "{{ compiled_app_model.host_assigned_apps_digest }}"
+    inventory_topology_digest: "{{ compiled_app_model.inventory_topology_digest }}"
+    app_model_naming_scheme: "{{ compiled_app_model.naming_scheme }}"
+    host_apps: "{{ compiled_app_model.host_apps }}"
+    deployment_is_targeted: "{{ compiled_app_model.deployment_is_targeted }}"
+    host_app_dependency_order: "{{ compiled_app_model.host_app_dependency_order }}"
+    host_app_dependency_closures: "{{ compiled_app_model.host_app_dependency_closures }}"
+    host_container_resource_names: "{{ compiled_app_model.host_container_resource_names }}"
+    host_network_resource_names: "{{ compiled_app_model.host_network_resource_names }}"
+    host_service_resource_names: "{{ compiled_app_model.host_service_resource_names }}"
+    host_quadlet_resource_names: "{{ compiled_app_model.host_quadlet_resource_names }}"
+    host_unit_resource_names: "{{ compiled_app_model.host_unit_resource_names }}"
+    host_secret_resource_names: "{{ compiled_app_model.host_secret_resource_names }}"
+    host_published_port_allocations: "{{ compiled_app_model.host_published_port_allocations }}"
+    deploy_apps: "{{ compiled_app_model.deploy_apps }}"
+    deploy_app_service_order: "{{ compiled_app_model.deploy_app_service_order }}"
+    host_caddy_networks: "{{ compiled_app_model.host_caddy_networks }}"
+    deploy_caddy_networks: "{{ compiled_app_model.deploy_caddy_networks }}"

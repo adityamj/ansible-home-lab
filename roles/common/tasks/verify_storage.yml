@@ -1,0 +1,56 @@
+---
+- name: Verify canonical persistent storage path
+  ansible.builtin.include_tasks: verify_storage_path.yml
+
+# Path type, symlink ancestors and plain-mode mount status were checked above.
+- name: Require persistent storage root to exist
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - verified_data_mount.stat.exists
+    fail_msg: "data_mount '{{ data_mount }}' must exist before runtime activation or data writes."
+
+- name: Verify mounted-filesystem storage root
+  ansible.builtin.command:
+    argv: [mountpoint, --quiet, "{{ data_mount }}"]
+  changed_when: false
+  check_mode: false
+  when: storage_mode == 'mount'
+
+# One fresh mount-table observation per verification boundary, not four remote
+# findmnt calls. --list makes the JSON flat, including nested dataset mounts.
+- name: Inspect live mount table for managed ZFS datasets
+  ansible.builtin.command:
+    argv: [findmnt, --json, --list, --output, 'TARGET,SOURCE,FSTYPE']
+  register: managed_zfs_mount_table
+  changed_when: false
+  check_mode: false
+  when: storage_mode == 'zfs'
+
+- name: Require exact managed ZFS mount sources
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - matching_mounts | length == 1
+      - matching_mounts[0].source == storage_path.source
+      - matching_mounts[0].fstype == 'zfs'
+    fail_msg: >-
+      {{ storage_path.path }} must be mounted exactly once from
+      {{ storage_path.source }} as ZFS.
+  vars:
+    matching_mounts: >-
+      {{ (managed_zfs_mount_table.stdout | from_json).filesystems
+         | selectattr('target', 'equalto', storage_path.path) | list }}
+  loop:
+    - path: "{{ data_mount }}"
+      source: "{{ use_zpool }}/app-host"
+    - path: "{{ app_data_base_path }}"
+      source: "{{ use_zpool }}/app-host/apps"
+    - path: "{{ static_base_path }}"
+      source: "{{ use_zpool }}/app-host/static"
+    - path: "{{ data_mount }}/system"
+      source: "{{ use_zpool }}/app-host/system"
+  loop_control:
+    loop_var: storage_path
+    label: "{{ storage_path.path }}"
+  when: storage_mode == 'zfs'

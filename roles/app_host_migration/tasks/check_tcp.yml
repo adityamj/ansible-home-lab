@@ -1,0 +1,16 @@
+---
+- name: Verify every declared target TCP port from controller
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../tools/check_tcp_endpoint.py"
+      - "{{ migration_target_address }}"
+      - "{{ item.host_port | string }}"
+      - --timeout
+      - '10'
+  loop: "{{ migration_published_ports | selectattr('protocol', 'equalto', 'tcp') | list }}"
+  loop_control:
+    label: "tcp/{{ item.host_port }}"
+  delegate_to: localhost
+  become: false
+  changed_when: false

@@ -1,0 +1,36 @@
+---
+- name: Validate rootless Podman account names
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - podman_user is match('^[a-z_][a-z0-9_-]*$')
+      - podman_group is match('^[a-z_][a-z0-9_-]*$')
+      - podman_user not in ['root', '0']
+      - podman_group not in ['root', '0']
+    fail_msg: "podman_user and podman_group must identify a non-root account."
+
+- name: Read rootless Podman account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ podman_user }}"
+
+- name: Set rootless Podman account facts
+  ansible.builtin.set_fact:
+    podman_uid: "{{ ansible_facts.getent_passwd[podman_user][1] }}"
+    podman_gid: "{{ ansible_facts.getent_passwd[podman_user][2] }}"
+    podman_home: "{{ ansible_facts.getent_passwd[podman_user][4] }}"
+    podman_quadlet_dir: "/etc/containers/systemd/users/{{ ansible_facts.getent_passwd[podman_user][1] }}"
+    podman_user_systemd_env:
+      XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts.getent_passwd[podman_user][1] }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts.getent_passwd[podman_user][1] }}/bus"
+
+- name: Require an unprivileged Podman account
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - podman_uid | int > 0
+      - podman_gid | int > 0
+      - podman_home.startswith('/')
+      - podman_home not in ['/', '/root']
+      - not podman_home.startswith(data_mount + '/')
+    fail_msg: "The Podman account must be unprivileged and have a safe home directory."

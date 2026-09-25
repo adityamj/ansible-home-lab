@@ -1,0 +1,207 @@
+---
+- name: Validate managed firewall configuration
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Reject independent legacy iptables policy
+  ansible.builtin.include_tasks: check_legacy_backend.yml
+
+- name: Ensure nftables include directory
+  ansible.builtin.file:
+    path: /etc/nftables.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect existing managed nftables table
+  ansible.builtin.stat:
+    path: /etc/nftables.d/ansible-host-filter.nft
+    follow: false
+  register: existing_managed_firewall_fragment
+
+- name: Require safe existing managed nftables table
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        not existing_managed_firewall_fragment.stat.exists
+        or existing_managed_firewall_fragment.stat.isreg
+      - >-
+        not existing_managed_firewall_fragment.stat.exists
+        or not existing_managed_firewall_fragment.stat.islnk
+      - >-
+        not existing_managed_firewall_fragment.stat.exists
+        or existing_managed_firewall_fragment.stat.uid == 0
+      - >-
+        not existing_managed_firewall_fragment.stat.exists
+        or existing_managed_firewall_fragment.stat.gid == 0
+      - >-
+        not existing_managed_firewall_fragment.stat.exists
+        or existing_managed_firewall_fragment.stat.mode in ['0600', '0640', '0644']
+    fail_msg: "The existing managed nftables table is unsafe."
+
+- name: Read preserved managed nftables table
+  ansible.builtin.slurp:
+    src: /etc/nftables.d/ansible-host-filter.nft
+  register: preserved_managed_firewall_fragment
+  when:
+    - managed_firewall_preserve_existing
+    - existing_managed_firewall_fragment.stat.exists
+
+- name: Require preserved managed nftables provenance
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - >-
+        '# Managed by Ansible. Authoritative host nftables ruleset.'
+        in (preserved_managed_firewall_fragment.content | b64decode)
+    fail_msg: >-
+      Platform reconciliation preserves only an authoritative managed ruleset.
+      Run migrate_firewall_layout.yml first to preserve deployed allowances
+      while transitioning the old policy and boot wiring.
+  when:
+    - managed_firewall_preserve_existing
+    - existing_managed_firewall_fragment.stat.exists
+
+- name: Deploy validated managed nftables table
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.d/ansible-host-filter.nft
+    owner: root
+    group: root
+    mode: "0644"
+    force: >-
+      {{ not managed_firewall_preserve_existing
+         or not existing_managed_firewall_fragment.stat.exists }}
+    validate: /usr/sbin/nft --check --file %s
+  register: managed_firewall_fragment
+
+- name: Inspect deployed managed nftables table
+  ansible.builtin.stat:
+    path: /etc/nftables.d/ansible-host-filter.nft
+    follow: false
+    checksum_algorithm: sha256
+  register: deployed_managed_firewall_fragment
+
+- name: Inspect managed firewall runtime state
+  ansible.builtin.stat:
+    path: /etc/nftables.d/ansible-host-filter.state.yml
+    follow: false
+  register: managed_firewall_runtime_state
+
+- name: Require safe managed firewall runtime state
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - not managed_firewall_runtime_state.stat.exists or managed_firewall_runtime_state.stat.isreg
+      - not managed_firewall_runtime_state.stat.exists or not managed_firewall_runtime_state.stat.islnk
+      - not managed_firewall_runtime_state.stat.exists or managed_firewall_runtime_state.stat.uid == 0
+      - not managed_firewall_runtime_state.stat.exists or managed_firewall_runtime_state.stat.gid == 0
+      - not managed_firewall_runtime_state.stat.exists or managed_firewall_runtime_state.stat.mode == '0600'
+    fail_msg: "The managed firewall runtime state is unsafe."
+
+- name: Read managed firewall runtime state
+  ansible.builtin.slurp:
+    src: /etc/nftables.d/ansible-host-filter.state.yml
+  register: managed_firewall_runtime_state_content
+  when: managed_firewall_runtime_state.stat.exists
+
+- name: Decode managed firewall runtime state
+  ansible.builtin.set_fact:
+    managed_firewall_runtime_record: >-
+      {{ (managed_firewall_runtime_state_content.content | b64decode | from_yaml)
+         if managed_firewall_runtime_state.stat.exists else {} }}
+
+- name: Validate managed firewall runtime state
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - managed_firewall_runtime_record is mapping
+      - >-
+        not managed_firewall_runtime_state.stat.exists
+        or managed_firewall_runtime_record.fragment_checksum | default('') is match('^[0-9a-f]{64}$')
+      - >-
+        not managed_firewall_runtime_state.stat.exists
+        or managed_firewall_runtime_record.live_ruleset_checksum is not defined
+        or managed_firewall_runtime_record.live_ruleset_checksum is match('^[0-9a-f]{64}$')
+    fail_msg: "The managed firewall runtime state is invalid."
+
+- name: Prepare firewall platform wiring
+  ansible.builtin.include_tasks: platform_prepare.yml
+  when: managed_firewall_manage_platform
+
+- name: Validate active managed nftables table
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/nft
+      - --check
+      - --file
+      - /etc/nftables.d/ansible-host-filter.nft
+  changed_when: false
+
+- name: Inspect complete live nftables ruleset
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/nft
+      - list
+      - ruleset
+  register: existing_live_managed_firewall
+  changed_when: false
+
+- name: Atomically reconcile authoritative nftables ruleset
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/nft
+      - --file
+      - /etc/nftables.d/ansible-host-filter.nft
+  changed_when: true
+  when: >-
+    managed_firewall_force_refresh
+    or managed_firewall_fragment.changed
+    or not managed_firewall_runtime_state.stat.exists
+    or (managed_firewall_runtime_record.fragment_checksum | default('')
+        != deployed_managed_firewall_fragment.stat.checksum)
+    or (managed_firewall_runtime_record.live_ruleset_checksum | default('')
+        != (existing_live_managed_firewall.stdout | hash('sha256')))
+
+- name: Finish firewall platform reconciliation
+  ansible.builtin.include_tasks: platform_finish.yml
+  when: managed_firewall_manage_platform
+
+- name: Inspect final complete nftables ruleset
+  ansible.builtin.command:
+    argv:
+      - /usr/sbin/nft
+      - list
+      - ruleset
+  register: final_managed_firewall_table
+  changed_when: false
+
+- name: Inspect authoritative table ownership
+  ansible.builtin.command:
+    argv: [/usr/sbin/nft, --json, list, tables]
+  register: authoritative_firewall_tables
+  changed_when: false
+
+- name: Require exclusive nftables ownership
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - owned_tables | length == 1
+      - owned_tables[0].family == 'inet'
+      - owned_tables[0].name == 'ansible_host_filter'
+    fail_msg: "Another process is writing host firewall tables. Disable that firewall owner before retrying."
+  vars:
+    owned_tables: >-
+      {{ (authoritative_firewall_tables.stdout | from_json).nftables
+         | selectattr('table', 'defined') | map(attribute='table') | list }}
+
+- name: Persist managed firewall runtime state
+  ansible.builtin.copy:
+    dest: /etc/nftables.d/ansible-host-filter.state.yml
+    content: |
+      fragment_checksum: {{ deployed_managed_firewall_fragment.stat.checksum }}
+      live_ruleset_checksum: {{ final_managed_firewall_table.stdout | hash('sha256') }}
+    owner: root
+    group: root
+    mode: "0600"

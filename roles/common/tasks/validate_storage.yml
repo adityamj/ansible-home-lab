@@ -1,0 +1,27 @@
+---
+- name: Validate persistent storage configuration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - storage_mode is defined
+      - storage_mode | default('') is string
+      - storage_mode | default('') in ['mount', 'zfs', 'plain']
+      - data_mount is string
+      - data_mount.startswith('/')
+      - data_mount | length > 1
+      - data_mount != '/'
+      - not data_mount.endswith('/')
+      - "'//' not in data_mount"
+      - data_mount.split('/') | intersect(['.', '..']) | length == 0
+      - data_mount is match('^/[A-Za-z0-9_-]+(?:[./A-Za-z0-9_-]*[A-Za-z0-9_-])?$')
+      - app_data_base_path == data_mount + '/apps'
+      - static_base_path == data_mount + '/static'
+      - use_zpool is string
+      - >-
+        (storage_mode | default('') == 'zfs'
+         and use_zpool | length > 0
+         and use_zpool is match('^[A-Za-z][A-Za-z0-9_.:-]*$'))
+        or (storage_mode | default('') != 'zfs' and use_zpool | length == 0)
+    fail_msg: >-
+      storage_mode must explicitly be mount, zfs, or plain. ZFS mode requires
+      a valid use_zpool name; other modes prohibit use_zpool.

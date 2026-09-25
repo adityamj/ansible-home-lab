@@ -1,0 +1,225 @@
+---
+- name: Validate persistent storage settings
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/validate_storage.yml"
+
+- name: Verify persistent storage before migration
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/verify_storage.yml"
+
+- name: Discover and validate application model
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/app_discovery.yml"
+
+- name: Load rootless account identity for volume migration
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_facts.yml"
+
+- name: Prepare rootless user systemd manager
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/podman_user_systemd.yml"
+
+- name: Build legacy volume migration list
+  ansible.builtin.set_fact:
+    volume_migration_entries: >-
+      {%- set entries = [] -%}
+      {%- for app_model in deploy_apps -%}
+      {%-   set names = [] -%}
+      {%-   for app_container in app_model.containers -%}
+      {%-     for volume in app_container.volumes | default([]) -%}
+      {%-       if volume.name not in names -%}
+      {%-         set _ = names.append(volume.name) -%}
+      {%-         set _ = entries.append({
+                    'app': app_model.name,
+                    'name': volume.name,
+                    'source': app_data_base_path ~ '/' ~ app_model.name ~ '/' ~ volume.name,
+                    'destination': app_data_base_path ~ '/' ~ app_model.name ~ '/volumes/' ~ volume.name
+                  }) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ entries }}
+
+- name: Inspect legacy volumes
+  loop_control:
+    label: "{{ item.source }}"
+  ansible.builtin.stat:
+    path: "{{ item.source }}"
+    follow: false
+  loop: "{{ volume_migration_entries }}"
+  register: legacy_volume_stats
+
+- name: Inspect migrated volumes
+  loop_control:
+    label: "{{ item.destination }}"
+  ansible.builtin.stat:
+    path: "{{ item.destination }}"
+    follow: false
+  loop: "{{ volume_migration_entries }}"
+  register: migrated_volume_stats
+
+- name: Canonicalize legacy volume paths
+  loop_control:
+    label: "{{ item.source }}"
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ item.source }}"
+  loop: "{{ volume_migration_entries }}"
+  register: canonical_legacy_volume_paths
+  changed_when: false
+
+- name: Canonicalize migrated volume paths
+  loop_control:
+    label: "{{ item.destination }}"
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ item.destination }}"
+  loop: "{{ volume_migration_entries }}"
+  register: canonical_migrated_volume_paths
+  changed_when: false
+
+- name: Reject unsafe or conflicting volume paths
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - volume_migration_entries[volume_index].name != 'volumes'
+      - not source.stat.exists or source.stat.isdir
+      - not source.stat.exists or not source.stat.islnk
+      - not destination.stat.exists or destination.stat.isdir
+      - not destination.stat.exists or not destination.stat.islnk
+      - not (source.stat.exists and destination.stat.exists)
+      - canonical_legacy_volume_paths.results[volume_index].stdout == volume_migration_entries[volume_index].source
+      - canonical_migrated_volume_paths.results[volume_index].stdout == volume_migration_entries[volume_index].destination
+    fail_msg: >-
+      Volume {{ volume_migration_entries[volume_index].app }}/{{
+      volume_migration_entries[volume_index].name }} has conflicting paths.
+  loop: "{{ range(0, volume_migration_entries | length) | list }}"
+  loop_control:
+    loop_var: volume_index
+    label: "{{ volume_migration_entries[volume_index].app }}/{{ volume_migration_entries[volume_index].name }}"
+  vars:
+    source: "{{ legacy_volume_stats.results[volume_index] }}"
+    destination: "{{ migrated_volume_stats.results[volume_index] }}"
+
+- name: Select volumes and services requiring migration
+  ansible.builtin.set_fact:
+    pending_volume_migrations: >-
+      {%- set entries = [] -%}
+      {%- for result in legacy_volume_stats.results if result.stat.exists -%}
+      {%-   set _ = entries.append(result.item) -%}
+      {%- endfor -%}
+      {{ entries }}
+    volume_migration_services: >-
+      {%- set services = [] -%}
+      {%- set affected_apps = legacy_volume_stats.results
+             | selectattr('stat.exists') | map(attribute='item.app') | unique | list -%}
+      {%- for app_model in deploy_apps if app_model.name in affected_apps -%}
+      {%-   for app_container in app_model.containers -%}
+      {%-     set _ = services.append(app_container.service_name) -%}
+      {%-   endfor -%}
+      {%- endfor -%}
+      {{ services }}
+    volume_migration_app_paths: >-
+      {%- set paths = [] -%}
+      {%- for result in legacy_volume_stats.results if result.stat.exists -%}
+      {%-   set path = app_data_base_path ~ '/' ~ result.item.app -%}
+      {%-   if path not in paths -%}
+      {%-     set _ = paths.append(path) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ paths | sort }}
+
+- name: Stop affected application services
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - --user
+      - stop
+      - "{{ item }}"
+  loop: "{{ volume_migration_services }}"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: stopped_volume_services
+  changed_when: stopped_volume_services.rc == 0
+  failed_when: >-
+    stopped_volume_services.rc != 0
+    and 'not loaded' not in stopped_volume_services.stderr | lower
+
+- name: Recheck persistent storage before moving volumes
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/ansible-storage-ready
+  changed_when: false
+  check_mode: false
+
+- name: Protect application anchors before moving volumes
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ volume_migration_app_paths }}"
+
+- name: Recheck pending legacy volume paths
+  loop_control:
+    label: "{{ item.source }}"
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ item.source }}"
+  loop: "{{ pending_volume_migrations }}"
+  register: rechecked_legacy_volume_paths
+  changed_when: false
+
+- name: Recheck pending migrated volume paths
+  loop_control:
+    label: "{{ item.destination }}"
+  ansible.builtin.command:
+    argv:
+      - realpath
+      - --canonicalize-missing
+      - "{{ item.destination }}"
+  loop: "{{ pending_volume_migrations }}"
+  register: rechecked_migrated_volume_paths
+  changed_when: false
+
+- name: Require safe pending volume paths
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - rechecked_legacy_volume_paths.results[pending_volume_index].stdout == pending_volume_migrations[pending_volume_index].source
+      - rechecked_migrated_volume_paths.results[pending_volume_index].stdout == pending_volume_migrations[pending_volume_index].destination
+    fail_msg: "A pending volume path changed after services were stopped."
+  loop: "{{ range(0, pending_volume_migrations | length) | list }}"
+  loop_control:
+    loop_var: pending_volume_index
+    label: "{{ pending_volume_migrations[pending_volume_index].app }}/{{ pending_volume_migrations[pending_volume_index].name }}"
+
+- name: Create application volume directories
+  loop_control:
+    label: "{{ item.destination | dirname }}"
+  ansible.builtin.file:
+    path: "{{ item.destination | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ pending_volume_migrations }}"
+  become: true
+
+- name: Move legacy application volumes
+  loop_control:
+    label: "{{ item.source }} -> {{ item.destination }}"
+  ansible.builtin.command:
+    argv:
+      - mv
+      - --no-target-directory
+      - "{{ item.source }}"
+      - "{{ item.destination }}"
+  loop: "{{ pending_volume_migrations }}"
+  register: moved_volume
+  become: true
+  changed_when: moved_volume.rc == 0

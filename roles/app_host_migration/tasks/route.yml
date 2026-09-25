@@ -1,0 +1,135 @@
+---
+- name: Recover Caddy ingress before migration routing promotion
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/ensure_caddy_running.yml"
+
+- name: Read current site before migration routing promotion
+  ansible.builtin.slurp:
+    src: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+  register: migration_previous_site
+
+- name: Render HTTP-01 relay without replacing the live source application route
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../tools/inject_caddy_http01_relay.py"
+      - --target
+      - "{{ migration_target_address }}"
+      - --domains
+      - "{{ migration_model.domains | join(',') }}"
+    stdin: "{{ migration_previous_site.content | b64decode }}"
+    stdin_add_newline: false
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: migration_http01_site
+  when: migration_route == 'http01-relay'
+
+- name: Render target site with a file-backed final-copy gate
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ role_path }}/../../tools/inject_caddy_migration_gate.py"
+      - --domains
+      - "{{ migration_model.domains | join(',') }}"
+      - --token
+      - "{{ migration_gate_token }}"
+    stdin: "{{ migration_previous_site.content | b64decode }}"
+    stdin_add_newline: false
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: migration_gated_target_site
+  when: migration_route == 'target-gate'
+
+- name: Validate and gracefully promote migration route
+  block:
+    - name: Install migration-owned HTTP-01 relay into live source site
+      ansible.builtin.copy:
+        dest: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+        owner: root
+        group: "{{ podman_group }}"
+        mode: '0644'
+        content: "{{ migration_http01_site.stdout }}"
+      when: migration_route == 'http01-relay'
+
+    - name: Install gated normal target site
+      ansible.builtin.copy:
+        dest: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+        owner: root
+        group: "{{ podman_group }}"
+        mode: '0644'
+        content: "{{ migration_gated_target_site.stdout }}"
+      when: migration_route == 'target-gate'
+
+    - name: Install migration-owned whole site
+      ansible.builtin.copy:
+        dest: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+        owner: root
+        group: "{{ podman_group }}"
+        mode: '0644'
+        content: |
+          # Migration {{ migration_id }}; ordinary deployment must remain suspended.
+          {% for domain in migration_model.domains %}
+          {{ domain }} {
+          {% if migration_route == 'proxy' %}
+              reverse_proxy {{ migration_target_address }}:443 {
+                  # Hold eligible requests while final-copy/startup readiness changes.
+                  lb_try_duration {{ migration_handoff_retry_duration }}
+                  lb_try_interval {{ migration_handoff_retry_interval }}
+                  health_uri /.__migration_ready_{{ migration_gate_token }}
+                  health_interval {{ migration_handoff_health_interval }}
+                  health_timeout {{ migration_handoff_health_timeout }}
+                  health_headers {
+                      Host {{ domain }}
+                  }
+                  fail_duration {{ migration_handoff_retry_duration }}
+                  max_fails 1
+                  unhealthy_status 5xx
+                  header_up Host {{ domain }}
+                  transport http {
+                      tls
+                      tls_server_name {{ domain }}
+          {% if migration_model.ingress.handoff_upstream_http1 | default(false) %}
+                      # Preserve application-specific HTTP/1.1 Upgrade semantics.
+                      versions 1.1
+          {% endif %}
+                  }
+              }
+          {% else %}
+              tls {
+                  issuer acme {
+                      disable_tlsalpn_challenge
+                  }
+              }
+              respond "Application migration in progress" 503
+          {% endif %}
+          }
+          {% endfor %}
+      when: migration_route not in ['http01-relay', 'target-gate']
+
+    - name: Validate complete Caddy configuration
+      ansible.builtin.command:
+        argv: [podman, exec, caddy, caddy, validate, --config, /etc/caddy/Caddyfile]
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: false
+
+    - name: Gracefully reload Caddy without restarting it
+      ansible.builtin.command:
+        argv: [podman, exec, caddy, caddy, reload, --force, --address, unix//var/run/caddy.sock, --config, /etc/caddy/Caddyfile]
+      become: true
+      become_user: "{{ podman_user }}"
+      environment: "{{ podman_user_systemd_env }}"
+      changed_when: true
+  rescue:
+    - name: Restore last site file without activating application services
+      ansible.builtin.copy:
+        dest: "{{ caddy_config_dir }}/sites-enabled/{{ migration_app }}.caddy"
+        content: "{{ migration_previous_site.content | b64decode }}"
+        owner: root
+        group: "{{ podman_group }}"
+        mode: '0644'
+    - name: Stop for routing recovery
+      ansible.builtin.fail:
+        msg: "Caddy promotion failed. Last file restored; inspect live routing before retry. No writer was restarted."

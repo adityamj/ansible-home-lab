@@ -1,0 +1,305 @@
+---
+- name: Validate operator-serialized migration contract
+  ansible.builtin.assert:
+    that:
+      - migration_operator_serialized | bool
+      - not ansible_check_mode
+      - source_host != target_host
+      - source_host in hostvars and target_host in hostvars
+      - ansible_play_hosts_all | sort == [source_host, target_host] | sort
+      - migration_phase in ['prepare', 'all', 'cutover', 'handoff', 'cleanup']
+      - migration_app is match('^[a-z0-9][a-z0-9-]*$')
+      - migration_id is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+      - migration_dependency_apps | length == 0
+      - >-
+        migration_phase not in ['prepare', 'all', 'cutover']
+        or (migration_app in (hostvars[source_host].assigned_apps | default([]))
+            and migration_app not in (hostvars[target_host].assigned_apps | default([])))
+      - >-
+        migration_phase not in ['prepare', 'all', 'cutover']
+        or ((hostvars[source_host].outgoing_migrations | default({})).get(migration_app, {}).get('target_host', '') == target_host
+            and (hostvars[target_host].incoming_migrations | default({})).get(migration_app, {}).get('source_host', '') == source_host)
+      - >-
+        migration_phase != 'handoff'
+        or ((migration_app in (hostvars[source_host].assigned_apps | default([]))
+             and migration_app not in (hostvars[target_host].assigned_apps | default([]))
+             and (hostvars[source_host].outgoing_migrations | default({})).get(migration_app, {}).get('target_host', '') == target_host
+             and (hostvars[target_host].incoming_migrations | default({})).get(migration_app, {}).get('source_host', '') == source_host)
+            or (migration_app not in (hostvars[source_host].assigned_apps | default([]))
+                and migration_app in (hostvars[target_host].assigned_apps | default([]))
+                and migration_app in (hostvars[source_host].draining_apps | default({}))
+                and hostvars[source_host].draining_apps[migration_app].target_host == target_host))
+      - >-
+        migration_phase != 'cleanup'
+        or (migration_app not in (hostvars[source_host].assigned_apps | default([]))
+            and migration_app in (hostvars[target_host].assigned_apps | default([]))
+            and migration_app in (hostvars[source_host].draining_apps | default({})))
+      - migration_preflight_argv is sequence and migration_preflight_argv is not string
+      - migration_frozen_argv is sequence and migration_frozen_argv is not string
+      - migration_healthy_argv is sequence and migration_healthy_argv is not string
+      - migration_cleanup_argv is sequence and migration_cleanup_argv is not string
+      - hostvars[source_host].ansible_host | default('') is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+      - migration_target_address is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+      - migration_transfer_destination is match('^[a-z_][a-z0-9_-]*@[A-Za-z0-9.-]+$')
+      - migration_transfer_destination.split('@')[1] == target_host
+      - migration_rsync_ssh | length > 0
+    fail_msg: >-
+      Review the migration contract in migration.md. Both exact inventory hosts
+      must participate (no --limit); no concurrent automation until reconciliation.
+      This version supports one dependency-free HTTP app with named volumes.
+
+- name: Retain workflow defaults and authorize migration-owned reconciliation
+  ansible.builtin.set_fact:
+    app_migration_execution: true
+    migration_phase: "{{ migration_phase }}"
+    migration_id: "{{ migration_id }}"
+    migration_state_dir: "{{ migration_state_dir }}"
+    migration_confirm_cutover: "{{ migration_confirm_cutover }}"
+    migration_approve_target_prune: "{{ migration_approve_target_prune }}"
+    migration_confirm_endpoint_retirement: "{{ migration_confirm_endpoint_retirement }}"
+    migration_direct_port_policy: "{{ migration_direct_port_policy }}"
+    migration_preflight_argv: "{{ migration_preflight_argv }}"
+    migration_frozen_argv: "{{ migration_frozen_argv }}"
+    migration_healthy_argv: "{{ migration_healthy_argv }}"
+    migration_cleanup_argv: "{{ migration_cleanup_argv }}"
+    migration_target_address: "{{ migration_target_address }}"
+    migration_transfer_destination: "{{ migration_transfer_destination }}"
+    migration_transfer_state_dir: "{{ migration_transfer_state_dir }}"
+    migration_transfer_key_path: "{{ migration_transfer_key_path }}"
+    migration_static_transfer_key_path: "{{ migration_static_transfer_key_path }}"
+    migration_transfer_known_hosts_path: "{{ migration_transfer_known_hosts_path }}"
+    migration_rsync_ssh: "{{ migration_rsync_ssh }}"
+    migration_static_rsync_ssh: "{{ migration_static_rsync_ssh }}"
+
+- name: Load platform prerequisites without starting the user manager
+  ansible.builtin.import_role:
+    name: apps
+    tasks_from: preflight
+
+- name: Inspect active migration record directory
+  ansible.builtin.stat:
+    path: "{{ migration_state_dir }}"
+    follow: false
+  register: migration_records_directory
+
+- name: Discover concurrent migration records on this host
+  ansible.builtin.find:
+    paths: "{{ migration_state_dir }}"
+    patterns: '*.json'
+    file_type: file
+    recurse: false
+  register: migration_record_files
+  when: migration_records_directory.stat.isdir | default(false)
+
+- name: Read concurrent migration records
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  loop: "{{ migration_record_files.files | default([]) }}"
+  register: migration_other_records_raw
+
+- name: Build migration runtime ownership overlay
+  ansible.builtin.set_fact:
+    migration_overlay_records: >-
+      {%- set records = [] -%}
+      {%- for result in migration_other_records_raw.results | default([]) -%}
+      {%- set record = result.content | b64decode | from_json -%}
+      {%- if record.app | default('') != migration_app -%}
+      {%- set _ = records.append(record) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ records }}
+    migration_overlay_apps: >-
+      {%- set apps = [] -%}
+      {%- for result in migration_other_records_raw.results | default([]) -%}
+      {%- set record = result.content | b64decode | from_json -%}
+      {%- if record.app | default('') != migration_app and record.app | default('') not in (draining_apps | default({})) -%}
+      {%- set _ = apps.append(record.app) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ apps | unique | sort }}
+
+- name: Validate migration ownership overlay records
+  ansible.builtin.assert:
+    that:
+      - item.version | default(0) == 2
+      - item.app is match('^[a-z0-9][a-z0-9-]*$')
+      - inventory_hostname in [item.source_host, item.target_host]
+      - item.source_host != item.target_host
+    fail_msg: "Invalid concurrent migration record; runtime ownership is ambiguous."
+  loop: "{{ migration_overlay_records }}"
+  loop_control:
+    label: "{{ item.app | default('invalid') }}"
+
+- name: Compile reviewed migration catalog with active runtime ownership
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/app_discovery.yml"
+  vars:
+    target_app: "{{ migration_app }}"
+    app_model_assigned_apps: >-
+      {{ ((assigned_apps | default([])) + migration_overlay_apps
+          + ([] if migration_app in (draining_apps | default({})) else [migration_app]))
+         | unique | list }}
+
+- name: Select migration application
+  ansible.builtin.set_fact:
+    migration_model: "{{ deploy_apps | first }}"
+
+- name: Derive migration runtime resource names
+  ansible.builtin.set_fact:
+    migration_service_names: >-
+      {%- set services = [] -%}
+      {%- for container in migration_model.containers -%}
+      {%-   set _ = services.append(container.service_name) -%}
+      {%-   if container.published_ports | default([]) | length > 0 -%}
+      {%-     set _ = services.append(container.ingress_service_name) -%}
+      {%-     set _ = services.append(container.pasta_service_name) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ services }}
+    migration_network_service_names: >-
+      {{ migration_model.networks | default([]) | map(attribute='service_name') | list }}
+    migration_caddy_network_names: >-
+      {{ migration_model.networks | default([])
+         | selectattr('caddy', 'defined') | selectattr('caddy')
+         | map(attribute='physical_name') | list }}
+
+- name: Collect declared direct host ports
+  ansible.builtin.set_fact:
+    migration_published_ports: >-
+      {%- set ports = [] -%}
+      {%- for container in migration_model.containers -%}
+      {%- for port in container.published_ports | default([]) -%}
+      {%- set _ = ports.append(port | combine({'container': container.name, 'physical_name': container.physical_name})) -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {{ ports }}
+
+- name: Reject unsupported dependency and data models
+  ansible.builtin.assert:
+    that:
+      - deploy_apps | length == 1
+      - migration_model.requires_apps | length == 0
+      - migration_model.domains | length > 0
+      - migration_model.domains | select('match', '^\\*\\.') | list | length == 0
+      - migration_direct_port_policy in ['reject', 'outage_until_dns']
+      - migration_published_ports | length == 0 or migration_direct_port_policy == 'outage_until_dns'
+      - migration_published_ports | map(attribute='protocol') | list | difference(['tcp', 'udp']) | length == 0
+    fail_msg: >-
+      Dependencies and static data remain unsupported. Declared TCP/UDP ports
+      require migration_direct_port_policy=outage_until_dns.
+
+- name: Run optional application-specific backup, writer and namespace preflight
+  ansible.builtin.command:
+    argv: "{{ migration_preflight_argv }}"
+  changed_when: false
+  when: migration_preflight_argv | length > 0
+
+- name: Verify required transfer tools are executable
+  ansible.builtin.command:
+    argv: [/usr/bin/test, -x, "{{ item }}"]
+  loop:
+    - /usr/bin/rsync
+    - /usr/bin/ssh
+    - /usr/bin/curl
+    - /usr/bin/crun
+  changed_when: false
+
+- name: Read subordinate ID allocations
+  ansible.builtin.command:
+    argv: [grep, '-E', "^{{ podman_user }}:", "{{ item }}"]
+  loop: [/etc/subuid, /etc/subgid]
+  register: migration_subids
+  changed_when: false
+
+- name: Build semantic data manifest
+  ansible.builtin.set_fact:
+    migration_volume_names: "{{ migration_model.containers | map(attribute='volumes') | flatten | map(attribute='name') | unique | sort }}"
+    migration_has_static_data: "{{ migration_model.type == 'static' or migration_model.static_paths | default([]) | length > 0 }}"
+    migration_static_root: "{{ static_base_path }}/{{ migration_app }}"
+    migration_model_digest: "{{ migration_model | to_json | hash('sha256') }}"
+    migration_state_path: "{{ migration_state_dir }}/{{ migration_app }}.json"
+
+- name: Inspect migration state path
+  ansible.builtin.stat:
+    path: "{{ migration_state_path }}"
+    follow: false
+  register: migration_record_stat
+
+- name: Reject unsafe state file
+  ansible.builtin.assert:
+    that:
+      - not migration_record_stat.stat.exists or (migration_record_stat.stat.isreg and not migration_record_stat.stat.islnk and migration_record_stat.stat.uid == 0)
+
+- name: Read existing migration record
+  ansible.builtin.slurp:
+    src: "{{ migration_state_path }}"
+  when: migration_record_stat.stat.exists
+  register: migration_record_raw
+
+- name: Decode migration record
+  ansible.builtin.set_fact:
+    migration_record: "{{ (migration_record_raw.content | b64decode | from_json) if migration_record_stat.stat.exists else {} }}"
+
+- name: Reject conflicting or ambiguous migration state
+  ansible.builtin.assert:
+    that:
+      - migration_record == {} or migration_record.version | default(0) == 2
+      - migration_record == {} or migration_record.migration_id | default('') == migration_id
+      - migration_record == {} or migration_record.source_host | default('') == source_host
+      - migration_record == {} or migration_record.target_host | default('') == target_host
+      # Cleanup never transfers data or reactivates the source. Permit catalog
+      # evolution after handoff while retaining all explicit identity, data-path,
+      # activation and published-port checks below.
+      - migration_record == {} or migration_phase == 'cleanup' or migration_record.model_digest | default('') == migration_model_digest
+      - migration_record == {} or migration_record.data_mount | default('') == data_mount
+      - migration_record == {} or (migration_record.has_static_data | default(false) | bool) == (migration_has_static_data | bool)
+      - migration_record == {} or migration_record.static_root | default(migration_static_root) == migration_static_root
+      - migration_record == {} or migration_record.target_address | default('') == migration_target_address
+      - migration_record == {} or migration_phase == 'cleanup' or migration_record.direct_port_policy | default(migration_direct_port_policy) == migration_direct_port_policy
+      - migration_record == {} or migration_record.published_ports | default(migration_published_ports) == migration_published_ports
+      - migration_phase not in ['handoff', 'cleanup'] or (migration_record.target_activation_attempted | default(false) and migration_record.final_copy_verified | default(false))
+      - migration_record == {} or migration_record.target_activation_attempted is boolean
+      - migration_phase in ['handoff', 'cleanup'] or not (migration_record.target_activation_attempted | default(false))
+      - migration_phase not in ['cutover', 'handoff', 'cleanup'] or migration_record != {}
+      - migration_phase != 'cutover' or migration_record.prepared | default(false) | bool
+      - migration_record == {} or migration_phase == 'cleanup' or migration_record.gate_token | default('') is match('^[a-f0-9]{64}$')
+    fail_msg: "Conflicting, obsolete or activated migration record: stop and review both hosts; never replay a data copy after activation."
+
+- name: Inspect target app root before first preparation
+  ansible.builtin.stat:
+    path: "{{ data_mount }}/apps/{{ migration_app }}"
+    follow: false
+  register: migration_target_root
+  when: inventory_hostname == target_host
+
+- name: Inspect target static root before first preparation
+  ansible.builtin.stat:
+    path: "{{ migration_static_root }}"
+    follow: false
+  register: migration_target_static_root
+  when:
+    - inventory_hostname == target_host
+    - migration_has_static_data | bool
+
+- name: Refuse adoption of existing target application data
+  ansible.builtin.assert:
+    that:
+      - migration_record != {} or not migration_target_root.stat.exists
+      - migration_record != {} or not migration_has_static_data | bool or not migration_target_static_root.stat.exists
+  when: inventory_hostname == target_host
+
+- name: Define validated migration identity
+  ansible.builtin.set_fact:
+    migration_identity:
+      version: 2
+      migration_id: "{{ migration_id }}"
+      app: "{{ migration_app }}"
+      source_host: "{{ source_host }}"
+      target_host: "{{ target_host }}"
+      model_digest: "{{ migration_model_digest }}"
+      data_mount: "{{ data_mount }}"
+      has_static_data: "{{ migration_has_static_data | bool }}"
+      static_root: "{{ migration_static_root }}"
+      target_address: "{{ migration_target_address }}"
+      target_activation_attempted: false
+      direct_port_policy: "{{ migration_direct_port_policy }}"
+      published_ports: "{{ migration_published_ports }}"

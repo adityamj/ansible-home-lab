@@ -1,0 +1,34 @@
+---
+# nft flush ruleset also clears iptables-nft rules, but cannot clear the separate
+# iptables-legacy kernel backend. Fail rather than claiming sole policy ownership.
+- name: Locate legacy iptables inspection tools
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /usr/sbin/iptables-legacy-save
+    - /usr/sbin/ip6tables-legacy-save
+  register: legacy_firewall_tools
+
+- name: Inspect legacy IPv4 and IPv6 policies
+  ansible.builtin.command:
+    argv: ["{{ item.item }}"]
+  loop: "{{ legacy_firewall_tools.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.stat.exists
+  register: legacy_firewall_policies
+  changed_when: false
+
+- name: Require no independent legacy iptables rules
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.stdout | regex_search('(?m)^-A ') is none
+      - item.stdout | regex_search('(?m)^:[^ ]+ (?!ACCEPT )') is none
+    fail_msg: >-
+      iptables-legacy has independent rules or non-ACCEPT chains. Explicitly
+      retire that policy and its owner before authoritative nftables deployment.
+  loop: "{{ legacy_firewall_policies.results }}"
+  loop_control:
+    label: "{{ item.item.item }}"
+  when: not item.skipped | default(false)

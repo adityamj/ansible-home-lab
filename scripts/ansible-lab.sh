@@ -5,25 +5,26 @@ set -euo pipefail
 ### Configuration
 ### =========================
 
-VM_NAME="ansible-lab"
-BASE_DIR="/tank/data/vms/${VM_NAME}"
+VM_NAME="${VM_NAME:-ansible-lab}"
+BASE_DIR="${BASE_DIR:-${XDG_DATA_HOME:-${HOME}/.local/share}/ansible-app-host/${VM_NAME}}"
 
-BASE_IMG="${BASE_DIR}/debian-14-genericcloud-amd64-daily.qcow2"
+BASE_IMG="${BASE_DIR}/debian-12-genericcloud-amd64.qcow2"
 DISK_IMG="${BASE_DIR}/${VM_NAME}.qcow2"
 
 USER_DATA="${BASE_DIR}/user-data"
 META_DATA="${BASE_DIR}/meta-data"
 NETWORK_CONFIG="${BASE_DIR}/network-config"
 
-OS_VARIANT="debian13"
-NET_NAME="default"
-MAC_ADDR="52:54:00:ab:cd:ef"
+OS_VARIANT="${OS_VARIANT:-debian12}"
+NET_NAME="${NET_NAME:-default}"
+MAC_ADDR="${MAC_ADDR:-52:54:00:ab:cd:ef}"
+LAB_ADDRESS="${LAB_ADDRESS:-192.168.122.50/24}"
+LAB_GATEWAY="${LAB_GATEWAY:-192.168.122.1}"
+LAB_DNS="${LAB_DNS:-1.1.1.1,9.9.9.9}"
 
-MEMORY=4096
-VCPUS=2
-DISK_SIZE=20G
-
-DEBUG_PASSWORD=""
+MEMORY="${MEMORY:-4096}"
+VCPUS="${VCPUS:-2}"
+DISK_SIZE="${DISK_SIZE:-20G}"
 
 ### =========================
 ### Helpers
@@ -59,9 +60,9 @@ ensure_network() {
 
 fetch_base_image() {
   if [[ ! -f "${BASE_IMG}" ]]; then
-    echo "Downloading Debian Sid (unstable) cloud image..."
-    curl -L -o "${BASE_IMG}" \
-      https://cloud.debian.org/images/cloud/forky/daily/latest/debian-14-genericcloud-amd64-daily.qcow2
+    echo "Downloading Debian 12 cloud image..."
+    curl --fail --location --output "${BASE_IMG}" \
+      https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
   fi
 }
 
@@ -89,29 +90,22 @@ detect_pubkey() {
 
 write_cloud_init() {
   local pubkey="$1"
-  local password="$2"
 
   # user-data
   cat >"${USER_DATA}" <<EOF
 #cloud-config
 users:
   - default
-  - name: podman
+  - name: ansible
     groups: [sudo]
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     ssh_authorized_keys:
       - ${pubkey}
-    lock_passwd: false
+    lock_passwd: true
 
-ssh_pwauth: true
-disable_root: false
-
-chpasswd:
-  expire: false
-  list:
-    - podman:${password:-podman}
-    - root:${password:-root}
+ssh_pwauth: false
+disable_root: true
 
 console: ttyS0
 EOF
@@ -137,14 +131,12 @@ bridges:
   br0:
     interfaces: [uplink0]
     addresses:
-      - 192.168.122.50/24
+      - ${LAB_ADDRESS}
     routes:
       - to: default
-        via: 192.168.122.1
+        via: ${LAB_GATEWAY}
     nameservers:
-      addresses:
-        - 1.1.1.1
-        - 9.9.9.9
+      addresses: [${LAB_DNS}]
     parameters:
       stp: false
       forward-delay: 0
@@ -170,7 +162,7 @@ create() {
   local pubkey
   pubkey=$(detect_pubkey)
 
-  write_cloud_init "${pubkey}" "${DEBUG_PASSWORD}"
+  write_cloud_init "${pubkey}"
 
   qemu-img create -f qcow2 -b "${BASE_IMG}" -F qcow2 "${DISK_IMG}" "${DISK_SIZE}"
 
@@ -236,20 +228,11 @@ reset() {
 ### =========================
 
 ACTION="${1:-}"
-shift || true
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-  --password)
-    DEBUG_PASSWORD="$2"
-    shift 2
-    ;;
-  *)
-    echo "Unknown option: $1" >&2
-    exit 1
-    ;;
-  esac
-done
+if [[ $# -ne 1 ]]; then
+  echo "Usage: $0 {create|up|down|delete|reset}" >&2
+  exit 1
+fi
 
 case "${ACTION}" in
 create) create ;;
@@ -258,7 +241,7 @@ down) down ;;
 delete) delete ;;
 reset) reset ;;
 *)
-  echo "Usage: $0 {create|up|down|delete|reset} [--password <pw>]" >&2
+  echo "Usage: $0 {create|up|down|delete|reset}" >&2
   exit 1
   ;;
 esac

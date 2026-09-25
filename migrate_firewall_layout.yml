@@ -1,0 +1,10 @@
+---
+- name: Migrate table-only firewall to authoritative host policy
+  hosts: app_hosts
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Migrate firewall policy and boot wiring
+      ansible.builtin.include_role:
+        name: host_firewall
+        tasks_from: migrate_layout

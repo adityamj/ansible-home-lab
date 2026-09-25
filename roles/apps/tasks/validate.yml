@@ -1,0 +1,59 @@
+---
+- name: Locate installed Quadlet generator
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ quadlet_generator_paths }}"
+  register: installed_quadlet_generators
+
+- name: Require installed Quadlet generator
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - installed_quadlet_generators.results | selectattr('stat.exists') | list | length > 0
+    fail_msg: "The Podman Quadlet generator is not installed."
+
+- name: Select installed Quadlet generator
+  ansible.builtin.set_fact:
+    quadlet_generator_path: >-
+      {{ installed_quadlet_generators.results | selectattr('stat.exists') | map(attribute='item') | first }}
+
+- name: Validate rendered Quadlet units
+  ansible.builtin.command:
+    argv:
+      - "{{ quadlet_generator_path }}"
+      - --user
+      - --dryrun
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env | combine({'QUADLET_UNIT_DIRS': app_artifact_remote_dir ~ '/quadlets'}) }}"
+  changed_when: false
+
+# Keep validation separate from desired artifacts and reconcile it without churn.
+- name: Reconcile targeted Caddy validation workspace
+  ansible.builtin.include_tasks: stage_caddy_validation.yml
+  when: deployment_is_targeted
+
+- name: Validate rendered Caddy sites with active global config
+  ansible.builtin.command:
+    argv:
+      - podman
+      - run
+      - --rm
+      # Validation shares live Caddy files; never privately relabel them.
+      - --security-opt
+      - label=disable
+      - --volume
+      - "{{ caddy_config_dir }}/Caddyfile:/etc/caddy/Caddyfile:ro"
+      - --volume
+      - "{{ caddy_config_dir }}/snippets:/etc/caddy/snippets:ro"
+      - --volume
+      - "{{ app_caddy_validation_dir if deployment_is_targeted else app_artifact_remote_dir ~ '/caddy' }}/sites-enabled:/etc/caddy/sites-enabled:ro"
+      - "{{ caddy_image }}"
+      - caddy
+      - validate
+      - --config
+      - /etc/caddy/Caddyfile
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  changed_when: false

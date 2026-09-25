@@ -1,0 +1,56 @@
+---
+# Run only after subordinate IDs and the rootless manager are ready. Podman
+# info can initialize an empty store; never use it to decide whether changing
+# subordinate IDs is safe. Do not chown, relocate, or recreate an existing store.
+- name: Inspect effective rootless Podman storage configuration
+  ansible.builtin.command:
+    argv: [podman, info, --format, json]
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: podman_storage_info
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Validate effective rootless graphroot
+  when: not ansible_check_mode
+  block:
+    - name: Record observed graphroot and runroot
+      ansible.builtin.set_fact:
+        podman_graphroot: "{{ (podman_storage_info.stdout | from_json).store.graphRoot }}"
+        podman_runroot: "{{ (podman_storage_info.stdout | from_json).store.runRoot }}"
+
+    - name: Require an unprivileged dedicated storage location
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - (podman_storage_info.stdout | from_json).host.security.rootless
+          - podman_graphroot is string
+          - podman_graphroot.startswith('/')
+          - podman_graphroot not in ['/', '/root', podman_home, data_mount, app_data_base_path, static_base_path]
+          - not podman_graphroot.startswith('/etc/')
+          - not podman_graphroot.startswith(app_data_base_path + '/')
+          - not podman_graphroot.startswith(static_base_path + '/')
+        fail_msg: "Podman graphroot must be a dedicated rootless store, not configuration or application data."
+
+    - name: Require canonical graphroot without symlink ancestors
+      ansible.builtin.command:
+        argv: [realpath, -e, "{{ podman_graphroot }}"]
+      register: canonical_podman_graphroot
+      changed_when: false
+      failed_when: canonical_podman_graphroot.rc != 0 or canonical_podman_graphroot.stdout != podman_graphroot
+
+    - name: Inspect graphroot without enforcing ownership
+      ansible.builtin.stat:
+        path: "{{ podman_graphroot }}"
+        follow: false
+      register: podman_graphroot_stat
+
+    - name: Require a rootless-owned graphroot directory
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - podman_graphroot_stat.stat.isdir | default(false)
+          - not podman_graphroot_stat.stat.islnk | default(false)
+          - podman_graphroot_stat.stat.uid | default(-1) == podman_uid | int
+        fail_msg: "Effective graphroot is unsafe. Resolve storage configuration manually; automation will not change its ownership."

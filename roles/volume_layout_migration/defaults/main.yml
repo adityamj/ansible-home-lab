@@ -1,0 +1,34 @@
+---
+podman_user: podman
+podman_group: podman
+
+data_mount: /srv/data
+use_zpool: ""
+app_data_base_path: "{{ data_mount }}/apps"
+static_base_path: "{{ data_mount }}/static"
+apps_root: "{{ playbook_dir }}/apps"
+app_model_compiler_path: "{{ role_path }}/../../tools/compile_app_model.py"
+
+app_healthcheck_defaults:
+  path: /health
+  interval: 2s
+  timeout: 1s
+  passes: 2
+  fails: 1
+  status: 200
+  retry_duration: 20s
+  retry_interval: 500ms
+  fail_duration: 30s
+  max_fails: 1
+  unhealthy_status:
+    - 5xx
+app_runtime_healthcheck_defaults:
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 20s
+  on_failure: kill
+app_restart_policy: on-failure
+app_restart_sec: 5s
+app_memory_default: 512M
+app_pids_limit_default: 512

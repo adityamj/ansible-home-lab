@@ -1,0 +1,50 @@
+---
+- name: Require migration ports in the normal deployment firewall plan
+  ansible.builtin.assert:
+    that:
+      - matching_allocations | length == 1
+    fail_msg: >-
+      Normal target deployment does not own {{ item.protocol }}/{{ item.host_port }}
+      for {{ migration_app }}/{{ item.container }}.
+  loop: "{{ migration_published_ports }}"
+  loop_control:
+    label: "{{ item.protocol }}/{{ item.host_port }}"
+  vars:
+    matching_allocations: >-
+      {{ app_apply_plan.published_ports
+         | selectattr('app', 'equalto', migration_app)
+         | selectattr('container', 'equalto', item.container)
+         | selectattr('protocol', 'equalto', item.protocol)
+         | selectattr('host_port', 'equalto', item.host_port)
+         | selectattr('container_port', 'equalto', item.container_port) | list }}
+
+- name: Require source-preserving pasta ingress services
+  ansible.builtin.command:
+    argv: [systemctl, --user, is-active, "{{ item.physical_name }}-pasta.service"]
+  loop: "{{ migration_published_ports }}"
+  loop_control:
+    label: "{{ item.physical_name }}-pasta.service"
+  become: true
+  become_user: "{{ podman_user }}"
+  environment: "{{ podman_user_systemd_env }}"
+  register: migration_pasta_service_states
+  changed_when: false
+
+- name: Query live pasta listeners
+  ansible.builtin.command:
+    argv: "{{ ['ss', '-H', '-lnt' if item.protocol == 'tcp' else '-lnu'] }}"
+  loop: "{{ migration_published_ports }}"
+  loop_control:
+    label: "{{ item.protocol }}/{{ item.host_port }}"
+  register: migration_live_port_listeners
+  changed_when: false
+
+- name: Require every declared pasta listener
+  ansible.builtin.assert:
+    that:
+      - item.stdout_lines | select('search', ':' ~ (item.item.host_port | string) ~ '\\s') | list | length > 0
+    fail_msg: >-
+      Pasta ingress lacks the declared live {{ item.item.protocol }}/{{ item.item.host_port }} listener.
+  loop: "{{ migration_live_port_listeners.results }}"
+  loop_control:
+    label: "{{ item.item.protocol }}/{{ item.item.host_port }}"

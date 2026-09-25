@@ -1,0 +1,41 @@
+---
+- name: Inspect source migration public key
+  ansible.builtin.stat:
+    path: "{{ migration_transfer_key_path }}.pub"
+    follow: false
+  register: migration_transfer_public_key_stat
+  when: inventory_hostname == source_host
+
+- name: Read source migration public key for revocation
+  ansible.builtin.slurp:
+    src: "{{ migration_transfer_key_path }}.pub"
+  register: migration_transfer_public_key_cleanup_raw
+  when:
+    - inventory_hostname == source_host
+    - migration_transfer_public_key_stat.stat.exists
+
+- name: Publish source key for target revocation
+  ansible.builtin.set_fact:
+    migration_transfer_public_key_cleanup: "{{ migration_transfer_public_key_cleanup_raw.content | b64decode | trim }}"
+  when:
+    - inventory_hostname == source_host
+    - migration_transfer_public_key_cleanup_raw.content is defined
+
+- name: Remove forced receiver key from target
+  ansible.builtin.lineinfile:
+    path: /root/.ssh/authorized_keys
+    regexp: " migration-{{ migration_id | regex_escape }}(-(volumes|static))?$"
+    state: absent
+  when: inventory_hostname == target_host
+
+- name: Remove source migration private key and pinned host file
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ migration_transfer_key_path }}"
+    - "{{ migration_transfer_key_path }}.pub"
+    - "{{ migration_static_transfer_key_path }}"
+    - "{{ migration_static_transfer_key_path }}.pub"
+    - "{{ migration_transfer_known_hosts_path }}"
+  when: inventory_hostname == source_host
